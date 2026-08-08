@@ -4,6 +4,7 @@
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
+import { createSingleFlight } from "./lib/single-flight.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -1148,11 +1149,14 @@ export async function startServer(): Promise<StartedServer> {
     };
     await runRetentionSweep();
 
+    // Skip a scheduler tick while the previous one is still in flight so an
+    // over-running tick cannot overlap the next and re-dispatch the same sweeps.
+    const heartbeatSchedulerTickGuard = createSingleFlight();
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
       // can then wait through an already-running suppression check before it
       // captures the authoritative set of running heartbeat rows.
-      trackHeartbeatSchedulerWork((async () => {
+      trackHeartbeatSchedulerWork(heartbeatSchedulerTickGuard.run(async () => {
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
@@ -1319,7 +1323,7 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic heartbeat recovery failed");
             }));
         }
-      })().catch((err) => {
+      }).catch((err) => {
         logger.error({ err }, "heartbeat scheduler tick failed");
       }));
     });
