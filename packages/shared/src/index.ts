@@ -372,6 +372,8 @@ export {
   WAKEUP_TRIGGER_DETAILS,
   WAKEUP_REQUEST_STATUSES,
   LIVE_EVENT_TYPES,
+  ISSUE_EVENT_KINDS,
+  ISSUE_EVENT_ACTOR_TYPES,
   PRINCIPAL_TYPES,
   MEMBERSHIP_STATUSES,
   COMPANY_MEMBERSHIP_ROLES,
@@ -555,6 +557,8 @@ export {
   type WakeupTriggerDetail,
   type WakeupRequestStatus,
   type LiveEventType,
+  type IssueEventKind,
+  type IssueEventActorType,
   type PrincipalType,
   type MembershipStatus,
   type CompanyMembershipRole,
@@ -593,6 +597,13 @@ export {
   type PluginEventType,
   type PluginBridgeErrorCode,
 } from "./constants.js";
+
+export type { IssueEvent } from "./types/issue-event.js";
+export {
+  issueEventKindSchema,
+  issueEventActorTypeSchema,
+  issueEventSchema,
+} from "./validators/issue-event.js";
 
 export {
   generateSummarySlotSchema,

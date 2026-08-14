@@ -890,12 +890,35 @@ export const LIVE_EVENT_TYPES = [
   "heartbeat.run.log",
   "agent.status",
   "activity.logged",
+  "issue.event",
   "external_object.updated",
   "plugin.ui.updated",
   "plugin.worker.crashed",
   "plugin.worker.restarted",
 ] as const;
 export type LiveEventType = (typeof LIVE_EVENT_TYPES)[number];
+
+// Append-only per-issue event log (backlog item E). The DB CHECK on
+// issue_events.kind (packages/db/src/schema/issue_events.ts) mirrors this list
+// byte-for-byte — keep the two in lockstep (no test enforces the drift).
+export const ISSUE_EVENT_KINDS = [
+  "created",
+  "status_changed",
+  "assignee_changed",
+  "blocker_added",
+  "blocker_cleared",
+  "commented",
+  "comment_removed",
+  "approval_requested",
+  "approval_resolved",
+  "thread_interaction",
+  "run_started",
+  "run_finished",
+] as const;
+export type IssueEventKind = (typeof ISSUE_EVENT_KINDS)[number];
+
+export const ISSUE_EVENT_ACTOR_TYPES = ["agent", "user", "system", "plugin"] as const;
+export type IssueEventActorType = (typeof ISSUE_EVENT_ACTOR_TYPES)[number];
 
 export const PRINCIPAL_TYPES = ["user", "agent"] as const;
 export type PrincipalType = (typeof PRINCIPAL_TYPES)[number];
