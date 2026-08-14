@@ -3,6 +3,12 @@ import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactEventPayload } from "../redaction.js";
+import {
+  appendIssueEvent,
+  issueEventsDualWriteEnabled,
+  resolveApprovalEventActor,
+  resolveIssueEventActor,
+} from "./issue-events.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -38,6 +44,51 @@ export function issueApprovalService(db: Db) {
     }
 
     return { issue, approval };
+  }
+
+  // Emit the link's lifecycle events. Always `approval_requested` at createdAt,
+  // attributed to the requester. The reader collapses request+resolve into
+  // work-timeline's single `approved`; a still-pending approval surfaces via the
+  // request event alone (stamped at createdAt).
+  //
+  // If the approval was ALREADY decided when this link was created (an issue linked
+  // to a resolved approval), approvalService's resolve-time fan-out ran before this
+  // junction row existed, so also emit `approval_resolved` here — otherwise E5 would
+  // stamp `approved` at createdAt instead of the decision's decidedAt.
+  async function emitApprovalLinkEvents(
+    companyId: string,
+    issueId: string,
+    approval: typeof approvals.$inferSelect,
+  ) {
+    const requestedActor = resolveIssueEventActor(approval.requestedByAgentId, approval.requestedByUserId);
+    // source ref is the (issue, approval) link, not the approval — an approval fans
+    // out to N issues, so keying on approvalId alone would collide.
+    const sourceId = `${issueId}:${approval.id}`;
+    await appendIssueEvent(db, {
+      companyId,
+      issueId,
+      kind: "approval_requested",
+      actorType: requestedActor.actorType,
+      actorId: requestedActor.actorId,
+      sourceTable: "issue_approvals",
+      sourceId,
+      payload: { approvalId: approval.id, approvalType: approval.type, status: approval.status },
+      at: approval.createdAt ?? undefined,
+    });
+    if (approval.decidedAt) {
+      const resolvedActor = resolveApprovalEventActor(approval);
+      await appendIssueEvent(db, {
+        companyId,
+        issueId,
+        kind: "approval_resolved",
+        actorType: resolvedActor.actorType,
+        actorId: resolvedActor.actorId,
+        sourceTable: "issue_approvals",
+        sourceId,
+        payload: { approvalId: approval.id, status: approval.status, decisionNote: approval.decisionNote ?? null },
+        at: approval.decidedAt ?? undefined,
+      });
+    }
   }
 
   return {
@@ -105,7 +156,7 @@ export function issueApprovalService(db: Db) {
     },
 
     link: async (issueId: string, approvalId: string, actor?: LinkActor) => {
-      const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
+      const { issue, approval } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
 
       await db
         .insert(issueApprovals)
@@ -117,6 +168,10 @@ export function issueApprovalService(db: Db) {
           linkedByUserId: actor?.userId ?? null,
         })
         .onConflictDoNothing();
+
+      if (issueEventsDualWriteEnabled()) {
+        await emitApprovalLinkEvents(issue.companyId, issueId, approval);
+      }
 
       return db
         .select()
@@ -169,6 +224,12 @@ export function issueApprovalService(db: Db) {
           })),
         )
         .onConflictDoNothing();
+
+      if (issueEventsDualWriteEnabled()) {
+        for (const row of rows) {
+          await emitApprovalLinkEvents(row.companyId, row.id, approval);
+        }
+      }
     },
   };
 }

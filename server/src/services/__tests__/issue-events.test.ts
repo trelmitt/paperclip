@@ -14,7 +14,11 @@ function stubDb(returnedId: number, captured: { values?: Record<string, unknown>
     insert: () => ({
       values: (v: Record<string, unknown>) => {
         captured.values = v;
-        return { returning: () => Promise.resolve([{ id: returnedId }]) };
+        return {
+          onConflictDoNothing: () => ({
+            returning: () => Promise.resolve([{ id: returnedId }]),
+          }),
+        };
       },
     }),
   };

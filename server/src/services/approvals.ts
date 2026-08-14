@@ -1,8 +1,13 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { approvalComments, approvals, issueApprovals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import {
+  appendIssueEvent,
+  issueEventsDualWriteEnabled,
+  resolveApprovalEventActor,
+} from "./issue-events.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
@@ -41,6 +46,35 @@ export function approvalService(db: Db) {
     return existing;
   }
 
+  // One `approval_resolved` per linked issue, stamped at decidedAt. The issueId
+  // lives only in the issue_approvals junction, so fan out over it. Callers gate on
+  // the flag and only invoke this once a terminal decision actually landed.
+  async function emitApprovalResolved(approval: ApprovalRecord) {
+    const links = await db
+      .select({ issueId: issueApprovals.issueId, companyId: issueApprovals.companyId })
+      .from(issueApprovals)
+      .where(eq(issueApprovals.approvalId, approval.id));
+    if (links.length === 0) return;
+    const eventActor = resolveApprovalEventActor(approval);
+    for (const link of links) {
+      await appendIssueEvent(db, {
+        companyId: link.companyId,
+        issueId: link.issueId,
+        kind: "approval_resolved",
+        actorType: eventActor.actorType,
+        actorId: eventActor.actorId,
+        sourceTable: "issue_approvals",
+        sourceId: `${link.issueId}:${approval.id}`,
+        payload: {
+          approvalId: approval.id,
+          status: approval.status,
+          decisionNote: approval.decisionNote ?? null,
+        },
+        at: approval.decidedAt ?? undefined,
+      });
+    }
+  }
+
   async function resolveApproval(
     id: string,
     targetStatus: "approved" | "rejected",
@@ -72,6 +106,9 @@ export function approvalService(db: Db) {
       .then((rows) => rows[0] ?? null);
 
     if (updated) {
+      if (issueEventsDualWriteEnabled()) {
+        await emitApprovalResolved(updated);
+      }
       return { approval: updated, applied: true };
     }
 
@@ -137,6 +174,9 @@ export function approvalService(db: Db) {
         .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
         .returning()
         .then((rows) => rows[0] ?? null);
+      if (updated && issueEventsDualWriteEnabled()) {
+        await emitApprovalResolved(updated);
+      }
       return updated;
     },
 

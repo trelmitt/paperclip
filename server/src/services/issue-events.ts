@@ -48,6 +48,21 @@ export function resolveIssueEventActor(
 }
 
 /**
+ * Actor for an approval event, matching work-timeline's `approved` precedence
+ * (work-timeline.ts:694-701): the decider wins once decided, else the requester,
+ * else system. One `approval_requested` (decidedByUserId still null) resolves to
+ * the requester; one `approval_resolved` resolves to the decider.
+ */
+export function resolveApprovalEventActor(approval: {
+  decidedByUserId?: string | null;
+  requestedByAgentId?: string | null;
+  requestedByUserId?: string | null;
+}): { actorType: IssueEventActorType; actorId: string | null } {
+  if (approval.decidedByUserId) return { actorType: "user", actorId: approval.decidedByUserId };
+  return resolveIssueEventActor(approval.requestedByAgentId, approval.requestedByUserId);
+}
+
+/**
  * Appends one row to the append-only issue_events log (backlog E). No per-issue
  * seq is allocated — the bigserial id is the order key and the F/H replay cursor
  * (design decision Q2).
@@ -55,13 +70,21 @@ export function resolveIssueEventActor(
  * `dbOrTx` is typed `any` per the repo convention (a drizzle Tx is not assignable
  * to Db). Pass a transaction so the event commits atomically with the mutation
  * that caused it, and pass `postCommitPublications` so the live emit is deferred
- * until after that transaction commits; omit the list for a best-effort inline emit.
+ * until after that transaction commits (omit the list for rows-only, no live emit).
+ *
+ * The insert is `onConflictDoNothing`: source-bearing events (created per issue,
+ * commented per comment, approval_* per issue+approval link) collide on the
+ * partial unique index (source_table, source_id, kind) if the same logical event
+ * is written twice — a re-link, a retry, or the E4 backfill overlapping the live
+ * write. Swallowing that duplicate is exactly the idempotency Q3 designed the
+ * index for. Lifecycle events (source_id null) are unconstrained and never conflict.
+ * Returns the new row id, or null when the insert was a no-op (already present).
  */
 export async function appendIssueEvent(
   dbOrTx: any,
   input: AppendIssueEventInput,
   postCommitPublications?: IssueEventPublication[],
-): Promise<{ id: number }> {
+): Promise<{ id: number | null }> {
   const [row] = await dbOrTx
     .insert(issueEvents)
     .values({
@@ -76,6 +99,7 @@ export async function appendIssueEvent(
       payload: input.payload ?? {},
       ...(input.at ? { createdAt: input.at } : {}),
     })
+    .onConflictDoNothing()
     .returning({ id: issueEvents.id });
 
   // Live emit is opt-in and post-commit ONLY: the thunk is appended to a list the
@@ -84,14 +108,17 @@ export async function appendIssueEvent(
   // there is no reliable in-helper signal that the row is durable yet — emitting
   // early would deliver a phantom `issue.event` if that outer tx rolls back. The
   // cut-1 dual-write and the backfill pass no list (rows only); H wires the flush.
-  if (postCommitPublications) {
+  // On a conflict no-op there is no new row and nothing new happened, so there is
+  // nothing to emit — skip the thunk and report a null id.
+  if (postCommitPublications && row) {
+    const eventId = row.id;
     postCommitPublications.push(() =>
       publishLiveEvent({
         companyId: input.companyId,
         type: "issue.event",
         payload: {
           issueId: input.issueId,
-          eventId: row.id,
+          eventId,
           kind: input.kind,
           actorType: input.actorType,
           actorId: input.actorId ?? null,
@@ -100,5 +127,5 @@ export async function appendIssueEvent(
       }));
   }
 
-  return row;
+  return { id: row?.id ?? null };
 }

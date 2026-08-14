@@ -58,6 +58,11 @@ import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remot
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
+  appendIssueEvent,
+  issueEventsDualWriteEnabled,
+  resolveApprovalEventActor,
+} from "./issue-events.js";
+import {
   createToolRuntimeSupervisor,
   ToolRuntimeSupervisorError,
   type ToolRuntimeSupervisorOptions,
@@ -1651,6 +1656,24 @@ export function createToolGatewayService(
           linkedByAgentId: input.session.agentId,
         })
         .onConflictDoNothing();
+
+      // This path bypasses issueApprovalService.link, so emit approval_requested
+      // here too — otherwise a pending tool approval never reaches the event log
+      // (its resolution is still covered via approvalService's fan-out).
+      if (issueEventsDualWriteEnabled()) {
+        const eventActor = resolveApprovalEventActor(approval);
+        await appendIssueEvent(db, {
+          companyId: input.session.companyId,
+          issueId: input.session.issueId,
+          kind: "approval_requested",
+          actorType: eventActor.actorType,
+          actorId: eventActor.actorId,
+          sourceTable: "issue_approvals",
+          sourceId: `${input.session.issueId}:${approval.id}`,
+          payload: { approvalId: approval.id, approvalType: approval.type, status: approval.status },
+          at: approval.createdAt ?? undefined,
+        });
+      }
     }
 
     const interaction = await interactions.create(
