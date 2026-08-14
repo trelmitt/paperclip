@@ -78,22 +78,27 @@ export async function appendIssueEvent(
     })
     .returning({ id: issueEvents.id });
 
-  const publish: IssueEventPublication = () =>
-    publishLiveEvent({
-      companyId: input.companyId,
-      type: "issue.event",
-      payload: {
-        issueId: input.issueId,
-        eventId: row.id,
-        kind: input.kind,
-        actorType: input.actorType,
-        actorId: input.actorId ?? null,
-        ...input.payload,
-      },
-    });
-
-  if (postCommitPublications) postCommitPublications.push(publish);
-  else publish();
+  // Live emit is opt-in and post-commit ONLY: the thunk is appended to a list the
+  // caller flushes AFTER its OUTERMOST transaction commits. We never publish
+  // inline. A service can be built from an open transaction (issueService(tx)), so
+  // there is no reliable in-helper signal that the row is durable yet — emitting
+  // early would deliver a phantom `issue.event` if that outer tx rolls back. The
+  // cut-1 dual-write and the backfill pass no list (rows only); H wires the flush.
+  if (postCommitPublications) {
+    postCommitPublications.push(() =>
+      publishLiveEvent({
+        companyId: input.companyId,
+        type: "issue.event",
+        payload: {
+          issueId: input.issueId,
+          eventId: row.id,
+          kind: input.kind,
+          actorType: input.actorType,
+          actorId: input.actorId ?? null,
+          ...input.payload,
+        },
+      }));
+  }
 
   return row;
 }

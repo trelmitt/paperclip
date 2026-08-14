@@ -134,7 +134,6 @@ import {
   appendIssueEvent,
   issueEventsDualWriteEnabled,
   resolveIssueEventActor,
-  type IssueEventPublication,
 } from "./issue-events.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
@@ -6919,8 +6918,7 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      const issueEventPublications: IssueEventPublication[] = [];
-      const created = await db.transaction(async (tx) => {
+      return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -7212,32 +7210,26 @@ export function issueService(db: Db) {
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
         if (issueEventsDualWriteEnabled()) {
           const actor = resolveIssueEventActor(issueData.createdByAgentId, issueData.createdByUserId);
-          await appendIssueEvent(
-            tx,
-            {
-              companyId,
-              issueId: issue.id,
-              kind: "created",
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              actorRunId: actorRunId ?? null,
-              sourceTable: "issues",
-              sourceId: issue.id,
-              payload: {
-                status: issue.status,
-                assigneeAgentId: issue.assigneeAgentId,
-                assigneeUserId: issue.assigneeUserId,
-                parentId: issue.parentId,
-              },
-              at: issue.createdAt ?? undefined,
+          await appendIssueEvent(tx, {
+            companyId,
+            issueId: issue.id,
+            kind: "created",
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            actorRunId: actorRunId ?? null,
+            sourceTable: "issues",
+            sourceId: issue.id,
+            payload: {
+              status: issue.status,
+              assigneeAgentId: issue.assigneeAgentId,
+              assigneeUserId: issue.assigneeUserId,
+              parentId: issue.parentId,
             },
-            issueEventPublications,
-          );
+            at: issue.createdAt ?? undefined,
+          });
         }
         return withRelations;
       });
-      for (const publish of issueEventPublications) publish();
-      return created;
     },
 
     /**
@@ -7520,7 +7512,6 @@ export function issueService(db: Db) {
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications = postCommitActivityPublications ?? ownedActivityPublications;
-      const ownedIssueEventPublications: IssueEventPublication[] = [];
       const existing = await dbOrTx
         .select()
         .from(issues)
@@ -7925,36 +7916,35 @@ export function issueService(db: Db) {
             issueId: updated.id,
             actorType: actor.actorType,
             actorId: actor.actorId,
-            sourceTable: "issues",
-            sourceId: updated.id,
+            // Lifecycle events repeat per issue, so they carry no source ref —
+            // that keeps them out of the (source_table, source_id, kind) partial
+            // unique index, which exists only to dedup backfilled parity rows.
+            sourceTable: null,
+            sourceId: null,
           };
           if (receiptExisting.status !== updated.status) {
-            await appendIssueEvent(
-              tx,
-              { ...base, kind: "status_changed", payload: { from: receiptExisting.status, to: updated.status } },
-              ownedIssueEventPublications,
-            );
+            await appendIssueEvent(tx, {
+              ...base,
+              kind: "status_changed",
+              payload: { from: receiptExisting.status, to: updated.status },
+            });
           }
           if (
             receiptExisting.assigneeAgentId !== updated.assigneeAgentId ||
             receiptExisting.assigneeUserId !== updated.assigneeUserId
           ) {
-            await appendIssueEvent(
-              tx,
-              {
-                ...base,
-                kind: "assignee_changed",
-                payload: {
-                  assigneeAgentId: updated.assigneeAgentId,
-                  assigneeUserId: updated.assigneeUserId,
-                  fromAssigneeAgentId: receiptExisting.assigneeAgentId,
-                  fromAssigneeUserId: receiptExisting.assigneeUserId,
-                },
+            await appendIssueEvent(tx, {
+              ...base,
+              kind: "assignee_changed",
+              payload: {
+                assigneeAgentId: updated.assigneeAgentId,
+                assigneeUserId: updated.assigneeUserId,
+                fromAssigneeAgentId: receiptExisting.assigneeAgentId,
+                fromAssigneeUserId: receiptExisting.assigneeUserId,
               },
-              ownedIssueEventPublications,
-            );
+            });
           }
-          // Blocker add/clear events are emitted by syncBlockedByIssueIds (E2c), not here.
+          // Blocker add/clear events are emitted by syncBlockedByIssueIds (deferred to H), not here.
         }
         return {
           ...enriched,
@@ -7966,12 +7956,6 @@ export function issueService(db: Db) {
       const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications) publishActivity(publication);
-      }
-      // ponytail: external-tx callers (dbOrTx !== db) still write the event row
-      // atomically inside runUpdate; only the live emit defers to H, since
-      // flushing here would fire before the caller commits.
-      if (dbOrTx === db) {
-        for (const publish of ownedIssueEventPublications) publish();
       }
       return result;
     },
@@ -8406,9 +8390,8 @@ export function issueService(db: Db) {
       });
     },
 
-    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) => {
-      const issueEventPublications: IssueEventPublication[] = [];
-      const released = await db.transaction(async (tx) => {
+    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
+      db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -8466,45 +8449,40 @@ export function issueService(db: Db) {
             actorType: actor.actorType,
             actorId: actor.actorId,
             actorRunId: actorRunId ?? null,
-            sourceTable: "issues",
-            sourceId: updated.id,
+            // Lifecycle events repeat per issue, so they carry no source ref —
+            // that keeps them out of the (source_table, source_id, kind) partial
+            // unique index, which exists only to dedup backfilled parity rows.
+            sourceTable: null,
+            sourceId: null,
           };
           if (existing.status !== updated.status) {
-            await appendIssueEvent(
-              tx,
-              { ...base, kind: "status_changed", payload: { from: existing.status, to: updated.status } },
-              issueEventPublications,
-            );
+            await appendIssueEvent(tx, {
+              ...base,
+              kind: "status_changed",
+              payload: { from: existing.status, to: updated.status },
+            });
           }
           if (
             existing.assigneeAgentId !== updated.assigneeAgentId ||
             existing.assigneeUserId !== updated.assigneeUserId
           ) {
-            await appendIssueEvent(
-              tx,
-              {
-                ...base,
-                kind: "assignee_changed",
-                payload: {
-                  assigneeAgentId: updated.assigneeAgentId,
-                  assigneeUserId: updated.assigneeUserId,
-                  fromAssigneeAgentId: existing.assigneeAgentId,
-                  fromAssigneeUserId: existing.assigneeUserId,
-                },
+            await appendIssueEvent(tx, {
+              ...base,
+              kind: "assignee_changed",
+              payload: {
+                assigneeAgentId: updated.assigneeAgentId,
+                assigneeUserId: updated.assigneeUserId,
+                fromAssigneeAgentId: existing.assigneeAgentId,
+                fromAssigneeUserId: existing.assigneeUserId,
               },
-              issueEventPublications,
-            );
+            });
           }
         }
         return enriched;
-      });
-      for (const publish of issueEventPublications) publish();
-      return released;
-    },
+      }),
 
-    adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) => {
-      const issueEventPublications: IssueEventPublication[] = [];
-      const forceReleased = await db.transaction(async (tx) => {
+    adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) =>
+      db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -8542,23 +8520,21 @@ export function issueService(db: Db) {
         if (issueEventsDualWriteEnabled() && options.clearAssignee) {
           // Intent-based: adminForceRelease only reads id/run columns, so we can't
           // diff the prior assignee — clearAssignee is the signal an unassign happened.
-          await appendIssueEvent(
-            tx,
-            {
-              companyId: updated.companyId,
-              issueId: updated.id,
-              kind: "assignee_changed",
-              actorType: "system",
-              actorId: null,
-              sourceTable: "issues",
-              sourceId: updated.id,
-              payload: {
-                assigneeAgentId: updated.assigneeAgentId,
-                assigneeUserId: updated.assigneeUserId,
-              },
+          await appendIssueEvent(tx, {
+            companyId: updated.companyId,
+            issueId: updated.id,
+            kind: "assignee_changed",
+            actorType: "system",
+            actorId: null,
+            // Lifecycle event (repeats per issue) — no source ref, so it stays
+            // out of the source_kind partial unique index.
+            sourceTable: null,
+            sourceId: null,
+            payload: {
+              assigneeAgentId: updated.assigneeAgentId,
+              assigneeUserId: updated.assigneeUserId,
             },
-            issueEventPublications,
-          );
+          });
         }
         return {
           issue: enriched,
@@ -8567,10 +8543,7 @@ export function issueService(db: Db) {
             executionRunId: existing.executionRunId,
           },
         };
-      });
-      for (const publish of issueEventPublications) publish();
-      return forceReleased;
-    },
+      }),
 
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),
@@ -8857,6 +8830,31 @@ export function issueService(db: Db) {
         .update(issues)
         .set({ updatedAt: new Date() })
         .where(eq(issues.id, issueId));
+
+      if (issueEventsDualWriteEnabled()) {
+        // `commented` is the parity source the work-timeline reader consumes from
+        // issue_comments (work-timeline.ts:684-691) — same actor precedence and
+        // `at` = comment.createdAt, so the derived reader (E5) matches byte for byte.
+        // Written on the caller's handle so the row is atomic with the comment; no
+        // live emit is passed (rows only in cut-1 — H wires the post-commit feed).
+        const eventActor = resolveIssueEventActor(comment.authorAgentId, comment.authorUserId);
+        await appendIssueEvent(dbOrTx, {
+          companyId: comment.companyId,
+          issueId,
+          kind: "commented",
+          actorType: eventActor.actorType,
+          actorId: eventActor.actorId,
+          actorRunId: comment.createdByRunId ?? null,
+          sourceTable: "issue_comments",
+          sourceId: comment.id,
+          payload: {
+            authorAgentId: comment.authorAgentId,
+            authorUserId: comment.authorUserId,
+            authorType: comment.authorType,
+          },
+          at: comment.createdAt ?? undefined,
+        });
+      }
 
       if (
         authorType === "user" &&

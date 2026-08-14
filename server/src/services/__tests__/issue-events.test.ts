@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   appendIssueEvent,
   issueEventsDualWriteEnabled,
   type IssueEventPublication,
 } from "../issue-events.js";
+import * as liveEvents from "../live-events.js";
 
 // Minimal stub of the drizzle insert chain: captures the inserted values and
 // returns a fixed id, so the mapping + publish/defer logic is exercised without
@@ -62,9 +63,18 @@ describe("appendIssueEvent", () => {
     expect(() => pubs[0]()).not.toThrow();
   });
 
-  it("publishes inline when no post-commit list is given", async () => {
+  it("never publishes inline — with no post-commit list the row is written but no live event fires", async () => {
+    // Regression guard: emitting inline is unsafe because a service can be built
+    // from an open transaction (issueService(tx)), so the row may not be durable
+    // yet — an inline emit would be a phantom on rollback. Live emit is opt-in.
     const captured: { values?: Record<string, unknown> } = {};
-    await expect(appendIssueEvent(stubDb(1, captured), BASE)).resolves.toEqual({ id: 1 });
+    const spy = vi.spyOn(liveEvents, "publishLiveEvent");
+    try {
+      await expect(appendIssueEvent(stubDb(1, captured), BASE)).resolves.toEqual({ id: 1 });
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("sets createdAt from an explicit `at` (backfill path)", async () => {

@@ -61,12 +61,48 @@ describeEmbeddedPostgres("issue_events dual-write", () => {
       sourceId: issue.id,
     });
 
+    const comment = await svc.addComment(issue.id, "hello timeline", { userId });
+    const afterComment = await eventsFor(issue.id);
+    const commented = afterComment.find((row) => row.kind === "commented");
+    expect(commented).toMatchObject({
+      kind: "commented",
+      actorType: "user",
+      actorId: userId,
+      sourceTable: "issue_comments",
+      sourceId: comment.id,
+    });
+
     await svc.update(issue.id, { status: "cancelled", actorUserId: userId });
     const afterUpdate = await eventsFor(issue.id);
     const kinds = afterUpdate.map((row) => row.kind);
     expect(kinds).toContain("status_changed");
     const statusEvent = afterUpdate.find((row) => row.kind === "status_changed");
     expect(statusEvent?.payload).toMatchObject({ from: "todo", to: "cancelled" });
+  });
+
+  it("appends a second status_changed for the same issue without a unique-index collision", async () => {
+    process.env[FLAG] = "true";
+    const { companyId, userId } = await seedCompanyWithBoardAccess(ctx.db, "Repeat status");
+    const svc = issueService(ctx.db);
+
+    const issue = await svc.create(companyId, {
+      title: "Two transitions",
+      status: "backlog",
+      priority: "medium",
+      createdByUserId: userId,
+    } as Parameters<typeof svc.create>[1]);
+
+    // backlog -> todo -> cancelled: two status_changed rows, both source_id null,
+    // so the (source_table, source_id, kind) partial unique index never fires.
+    await svc.update(issue.id, { status: "todo", actorUserId: userId });
+    await svc.update(issue.id, { status: "cancelled", actorUserId: userId });
+
+    const statusRows = (await eventsFor(issue.id)).filter((row) => row.kind === "status_changed");
+    expect(statusRows).toHaveLength(2);
+    expect(statusRows.map((row) => row.payload)).toEqual([
+      { from: "backlog", to: "todo" },
+      { from: "todo", to: "cancelled" },
+    ]);
   });
 
   it("writes nothing when the flag is off", async () => {
@@ -80,6 +116,7 @@ describeEmbeddedPostgres("issue_events dual-write", () => {
       priority: "medium",
       createdByUserId: userId,
     } as Parameters<typeof svc.create>[1]);
+    await svc.addComment(issue.id, "no event", { userId });
     await svc.update(issue.id, { status: "cancelled", actorUserId: userId });
 
     expect(await eventsFor(issue.id)).toHaveLength(0);
