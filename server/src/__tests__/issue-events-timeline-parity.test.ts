@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { approvals as approvalsTable, issueApprovals } from "@paperclipai/db";
+import { activityLog, approvals as approvalsTable, issueApprovals } from "@paperclipai/db";
 import type { WorkTimelineEvent } from "@paperclipai/shared";
+import { logActivity } from "../services/activity-log.js";
 import { approvalService } from "../services/approvals.js";
 import { issueApprovalService } from "../services/issue-approvals.js";
 import { issueService } from "../services/issues.js";
@@ -22,6 +23,9 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
     resetEach: async (db) => {
       await db.delete(issueApprovals);
       await db.delete(approvalsTable);
+      // Real service calls (issueService.create) + the explicit assign log write
+      // activity_log rows that FK companies with no cascade — clear them first.
+      await db.delete(activityLog);
       await resetCompanyIssueFixtures(db);
     },
   });
@@ -40,12 +44,11 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
   const key = (e: WorkTimelineEvent) => `${e.at}|${e.kind}|${e.issueId}|${e.actorId}`;
   const norm = (events: WorkTimelineEvent[]) => events.map(key).sort();
 
-  // work-timeline covers four derived event kinds; the log currently carries three.
-  // `assigned` (activity-log-derived) and interaction-`approved` (deferred E3b) are
-  // the known remaining gaps, filtered out of the parity comparison below.
-  const WIRED_KINDS = new Set(["created", "commented", "approved"]);
+  // work-timeline covers four derived event kinds; the log now carries all but
+  // interaction-`approved` (deferred E3b), filtered out of the comparison below.
+  const WIRED_KINDS = new Set(["created", "commented", "approved", "assigned"]);
 
-  it("reproduces created + commented + approved for a live-written issue set", async () => {
+  it("reproduces created + commented + approved + assigned for a live-written issue set", async () => {
     const { companyId, userId } = await seedCompanyWithBoardAccess(ctx.db, "Parity");
     const issues = issueService(ctx.db);
     const approvals = approvalService(ctx.db);
@@ -66,6 +69,18 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
     await junction.link(issueB.id, approval.id, { userId });
     await approvals.approve(approval.id, "decider-user");
 
+    // An assign activity — the exact signal work-timeline derives `assigned` from.
+    // The flag-on hook in persistActivity mirrors it into the log.
+    await logActivity(ctx.db, {
+      companyId,
+      actorType: "user",
+      actorId: userId,
+      action: "issue.assigned",
+      entityType: "issue",
+      entityId: issueB.id,
+      details: { assigneeUserId: userId },
+    });
+
     const from = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const to = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
@@ -82,11 +97,11 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
       to,
     });
 
-    // Sanity: the fixture actually exercised all three wired kinds.
+    // Sanity: the fixture actually exercised all four wired kinds.
     const kinds = new Set(expected.map((e) => e.kind));
-    expect(kinds).toEqual(new Set(["created", "commented", "approved"]));
-    // 2 created + 2 commented + 2 approved (one per fanned-out link).
-    expect(expected).toHaveLength(6);
+    expect(kinds).toEqual(new Set(["created", "commented", "approved", "assigned"]));
+    // 2 created + 2 commented + 2 approved (one per fanned-out link) + 1 assigned.
+    expect(expected).toHaveLength(7);
 
     expect(norm(actual)).toEqual(norm(expected));
   });

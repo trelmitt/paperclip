@@ -1,6 +1,6 @@
-import { and, asc, eq, gt, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, like, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvals, issueApprovals, issueComments, issues } from "@paperclipai/db";
+import { activityLog, approvals, issueApprovals, issueComments, issues } from "@paperclipai/db";
 import {
   appendIssueEvent,
   resolveApprovalEventActor,
@@ -21,21 +21,24 @@ import {
  * control-plane scale; add a keyset checkpoint table only if a company's row count
  * ever makes the full re-scan itself the bottleneck.)
  *
- * Scope mirrors the live dual-write's source-bearing kinds. Lifecycle events
- * (status_changed / assignee_changed, source_id null) are deliberately NOT
- * backfilled: they are unconstrained (would double on re-run) and the transition
- * history they capture is unrecoverable from the current issue row. work-timeline's
- * derived `assigned` comes from the activity log, wired later with E5's reader.
+ * Scope mirrors the live dual-write's source-bearing kinds. The issue-row-diff
+ * lifecycle events (status_changed / assignee_changed with a null source) are
+ * deliberately NOT backfilled: they are unconstrained (would double on re-run) and
+ * their transition history is unrecoverable from the current issue row. The
+ * ACTIVITY-LOG-sourced `assignee_changed` (source_table="activity_log") IS
+ * backfilled — it is the `assigned` parity signal and is source-bearing/idempotent.
  * Thread-interaction (`approved`) backfill is deferred with E3b.
  */
 export type IssueEventsBackfillResult = {
   scannedIssues: number;
   scannedComments: number;
   scannedApprovalLinks: number;
+  scannedAssignLogs: number;
   created: number;
   commented: number;
   approvalRequested: number;
   approvalResolved: number;
+  assigned: number;
 };
 
 const DEFAULT_BATCH_SIZE = 500;
@@ -50,10 +53,12 @@ export async function backfillIssueEvents(
     scannedIssues: 0,
     scannedComments: 0,
     scannedApprovalLinks: 0,
+    scannedAssignLogs: 0,
     created: 0,
     commented: 0,
     approvalRequested: 0,
     approvalResolved: 0,
+    assigned: 0,
   };
 
   // 1) created — one per issue. Not part of work-timeline parity (its events array
@@ -210,6 +215,62 @@ export async function backfillIssueEvents(
     }
   }
   log(`approvals: scanned ${result.scannedApprovalLinks} links, wrote ${result.approvalRequested} requested / ${result.approvalResolved} resolved`);
+
+  // 4) assigned — the activity-log-sourced `assignee_changed` events. Mirror
+  // work-timeline's exact filter: issue activities whose action contains "assign".
+  // Inner-join issues (casting the uuid side to text — always safe) so an assign
+  // row for a since-deleted issue is skipped instead of FK-violating; work-timeline
+  // likewise never surfaces those. Keyed on the activity row id -> idempotent.
+  let assignCursor: string | null = null;
+  for (;;) {
+    const rows = await db
+      .select({
+        id: activityLog.id,
+        companyId: activityLog.companyId,
+        entityId: activityLog.entityId,
+        actorType: activityLog.actorType,
+        actorId: activityLog.actorId,
+        action: activityLog.action,
+        runId: activityLog.runId,
+        createdAt: activityLog.createdAt,
+      })
+      .from(activityLog)
+      .innerJoin(issues, sql`${issues.id}::text = ${activityLog.entityId}`)
+      .where(
+        assignCursor === null
+          ? and(eq(activityLog.entityType, "issue"), like(activityLog.action, "%assign%"))
+          : and(
+              eq(activityLog.entityType, "issue"),
+              like(activityLog.action, "%assign%"),
+              gt(activityLog.id, assignCursor),
+            ),
+      )
+      .orderBy(asc(activityLog.id))
+      .limit(batchSize);
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      const actorType = row.actorType === "agent" || row.actorType === "user" || row.actorType === "plugin"
+        ? row.actorType
+        : "system";
+      const { id } = await appendIssueEvent(db, {
+        companyId: row.companyId,
+        issueId: row.entityId,
+        kind: "assignee_changed",
+        actorType,
+        actorId: row.actorId,
+        actorRunId: row.runId ?? null,
+        sourceTable: "activity_log",
+        sourceId: row.id,
+        payload: { action: row.action },
+        at: row.createdAt ?? undefined,
+      });
+      if (id !== null) result.assigned += 1;
+    }
+    result.scannedAssignLogs += rows.length;
+    assignCursor = rows[rows.length - 1]!.id;
+    log(`assigned: scanned ${result.scannedAssignLogs} assign logs, wrote ${result.assigned}`);
+    if (rows.length < batchSize) break;
+  }
 
   return result;
 }

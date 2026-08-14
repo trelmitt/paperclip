@@ -5,6 +5,7 @@ import { activityLog, agentApiKeys, companies, heartbeatRuns, issues } from "@pa
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { publishLiveEvent } from "./live-events.js";
+import { appendIssueEvent, issueEventsDualWriteEnabled } from "./issue-events.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
@@ -171,7 +172,32 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     runId: input.runId ?? null,
     responsibleUserId,
     details: redactedDetails,
-  }).returning({ id: activityLog.id });
+  }).returning({ id: activityLog.id, createdAt: activityLog.createdAt });
+
+  // Dual-write the `assigned` parity source (backlog E). work-timeline derives
+  // its `assigned` event from exactly this filter — an issue activity whose action
+  // contains "assign" — so mirroring it here keeps the derived reader in parity.
+  // Written on the caller's handle (atomic with the activity row); keyed on the
+  // activity row id so it is idempotent and never collides with E2's lifecycle
+  // `assignee_changed` (which carries a null source). Rows only — no live emit.
+  if (
+    issueEventsDualWriteEnabled()
+    && input.entityType === "issue"
+    && input.action.includes("assign")
+  ) {
+    await appendIssueEvent(db, {
+      companyId: input.companyId,
+      issueId: input.entityId,
+      kind: "assignee_changed",
+      actorType: input.actorType,
+      actorId: input.actorId,
+      actorRunId: input.runId ?? null,
+      sourceTable: "activity_log",
+      sourceId: activity.id,
+      payload: { action: input.action },
+      at: activity.createdAt ?? undefined,
+    });
+  }
 
   const payload = {
     actorType: input.actorType,

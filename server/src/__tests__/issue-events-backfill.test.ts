@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { approvals as approvalsTable, issueApprovals, issueComments, issueEvents, issues } from "@paperclipai/db";
+import { activityLog, approvals as approvalsTable, issueApprovals, issueComments, issueEvents, issues } from "@paperclipai/db";
 import { approvalService } from "../services/approvals.js";
 import { issueApprovalService } from "../services/issue-approvals.js";
 import { backfillIssueEvents } from "../services/issue-events-backfill.js";
@@ -20,6 +20,7 @@ describeEmbeddedPostgres("issue_events historical backfill", () => {
     resetEach: async (db) => {
       await db.delete(issueApprovals);
       await db.delete(approvalsTable);
+      await db.delete(activityLog);
       await resetCompanyIssueFixtures(db);
     },
   });
@@ -72,14 +73,36 @@ describeEmbeddedPostgres("issue_events historical backfill", () => {
     await junction.link(issueB, approval.id, { userId });
     await approvals.approve(approval.id, "decider-user");
 
+    // An assign activity on A, plus an orphan assign row (entityId points at no
+    // issue) that the backfill's issues join must skip instead of FK-violating.
+    await ctx.db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: userId,
+      action: "issue.assigned",
+      entityType: "issue",
+      entityId: issueA,
+    });
+    await ctx.db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: userId,
+      action: "issue.assigned",
+      entityType: "issue",
+      entityId: randomUUID(), // no such issue
+    });
+
     const first = await backfillIssueEvents(ctx.db, { batchSize: 1 });
     expect(first.created).toBeGreaterThanOrEqual(2);
     expect(first.commented).toBeGreaterThanOrEqual(1);
     expect(first.approvalRequested).toBe(2);
     expect(first.approvalResolved).toBe(2);
+    expect(first.assigned).toBe(1); // orphan row skipped by the issues join
 
     const aKinds = (await eventsFor(issueA)).map((r) => r.kind).sort();
-    expect(aKinds).toEqual(["approval_requested", "approval_resolved", "commented", "created"]);
+    expect(aKinds).toEqual(["approval_requested", "approval_resolved", "assignee_changed", "commented", "created"]);
+    const aAssign = (await eventsFor(issueA)).find((r) => r.kind === "assignee_changed");
+    expect(aAssign).toMatchObject({ sourceTable: "activity_log", actorType: "user", actorId: userId });
 
     // The soft-deleted comment is excluded — exactly one commented event on A.
     expect((await eventsFor(issueA)).filter((r) => r.kind === "commented")).toHaveLength(1);
@@ -94,6 +117,6 @@ describeEmbeddedPostgres("issue_events historical backfill", () => {
 
     // Idempotent + resumable: a second full run writes nothing new.
     const second = await backfillIssueEvents(ctx.db, { batchSize: 1 });
-    expect(second).toMatchObject({ created: 0, commented: 0, approvalRequested: 0, approvalResolved: 0 });
+    expect(second).toMatchObject({ created: 0, commented: 0, approvalRequested: 0, approvalResolved: 0, assigned: 0 });
   });
 });

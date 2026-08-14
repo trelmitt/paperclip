@@ -8,28 +8,30 @@ import type { WorkTimelineEvent } from "@paperclipai/shared";
  * issue_events log instead of re-deriving it from the 4 source tables
  * (work-timeline.ts:684-737). E6 flips the read behind a flag once parity holds.
  *
- * Reproduced kinds — the log currently covers three of work-timeline's four
- * derived event kinds:
+ * Reproduced kinds — the log now covers three of work-timeline's four derived
+ * event kinds plus `assigned`:
  *   - created   (issue_events `created`)      — one per issue, unconditional, at=createdAt
  *   - commented (issue_events `commented`)    — windowed on createdAt
  *   - approved  (approval_requested/_resolved)— collapsed per (issue,approval) link
+ *   - assigned  (issue_events `assignee_changed` with source_table="activity_log")
+ *     — the activity-log-sourced assign rows work-timeline derives `assigned` from.
+ *     E2's lifecycle `assignee_changed` (null source, issue-row-diff semantics) is
+ *     deliberately NOT read here — only the activity-log-sourced rows are the
+ *     `assigned` signal, exactly mirroring work-timeline's activity-log read.
  *
- * KNOWN GAPS (the parity test pins these; they are the remaining wiring):
- *   - `assigned`: work-timeline derives it from the activity log
- *     (action.includes("assign")); no such event is in the log yet (E2 emits a
- *     lifecycle `assignee_changed` with a null source, which is issue-row-diff
- *     semantics, not activity-log semantics).
- *   - `approved` from thread interactions: deferred with E3b, so interaction-only
- *     `approved` events are absent here.
+ * KNOWN GAP (the parity test pins it): `approved` from thread interactions is
+ * deferred with E3b, so interaction-only `approved` events are absent here.
  */
 
-const KINDS = ["created", "commented", "approval_requested", "approval_resolved"] as const;
+const KINDS = ["created", "commented", "approval_requested", "approval_resolved", "assignee_changed"] as const;
 
-// Match work-timeline's actorId encoding (work-timeline.ts:86, :689/:701): system
-// (and any actor without an id) collapses to the shared "system:system" id.
+// Match work-timeline's actorId encoding (work-timeline.ts:86): `${type}:${id}`.
+// For `assigned`, work-timeline uses the raw activity-log actorId even when the
+// actor type is system (`system:${row.actorId}`), so keep the id when present and
+// only fall back to the shared "system" id when it is null (created/commented/
+// approved system actors carry a null id, collapsing to "system:system").
 function encodeActor(actorType: string, actorId: string | null): string {
-  if (actorType === "system" || !actorId) return "system:system";
-  return `${actorType}:${actorId}`;
+  return `${actorType}:${actorId ?? "system"}`;
 }
 
 function inWindow(at: Date, from: Date, to: Date): boolean {
@@ -49,6 +51,7 @@ export async function deriveWorkTimelineEventsFromLog(
       kind: issueEvents.kind,
       actorType: issueEvents.actorType,
       actorId: issueEvents.actorId,
+      sourceTable: issueEvents.sourceTable,
       sourceId: issueEvents.sourceId,
       createdAt: issueEvents.createdAt,
     })
@@ -78,6 +81,17 @@ export async function deriveWorkTimelineEventsFromLog(
       events.push({
         actorId: encodeActor(row.actorType, row.actorId),
         kind: "commented",
+        issueId: row.issueId,
+        at: row.createdAt.toISOString(),
+      });
+    } else if (row.kind === "assignee_changed") {
+      // Only the activity-log-sourced rows are the `assigned` signal; the
+      // lifecycle assignee_changed (null source) is for the F/H live feed.
+      if (row.sourceTable !== "activity_log") continue;
+      if (!inWindow(row.createdAt, input.from, input.to)) continue;
+      events.push({
+        actorId: encodeActor(row.actorType, row.actorId),
+        kind: "assigned",
         issueId: row.issueId,
         at: row.createdAt.toISOString(),
       });
