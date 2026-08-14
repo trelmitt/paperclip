@@ -34,6 +34,20 @@ export function issueEventsDualWriteEnabled(): boolean {
 }
 
 /**
+ * Resolves an (agentId, userId) pair to the event's actor. Mirrors the
+ * `actorAgentId ? "agent" : actorUserId ? "user" : "system"` idiom the issue
+ * service already uses for logActivity, so the two logs attribute identically.
+ */
+export function resolveIssueEventActor(
+  agentId?: string | null,
+  userId?: string | null,
+): { actorType: IssueEventActorType; actorId: string | null } {
+  if (agentId) return { actorType: "agent", actorId: agentId };
+  if (userId) return { actorType: "user", actorId: userId };
+  return { actorType: "system", actorId: null };
+}
+
+/**
  * Appends one row to the append-only issue_events log (backlog E). No per-issue
  * seq is allocated — the bigserial id is the order key and the F/H replay cursor
  * (design decision Q2).
