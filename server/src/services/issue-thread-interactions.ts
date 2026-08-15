@@ -60,7 +60,9 @@ import { getTelemetryClient } from "../telemetry.js";
 import { logActivity } from "./activity-log.js";
 import {
   appendInteractionRowEvents,
+  flushIssueEventPublications,
   issueEventsDualWriteEnabled,
+  type IssueEventPublication,
 } from "./issue-events.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
@@ -816,12 +818,21 @@ async function emitResolvedInteractionsTelemetry(
 // keep the service's create-time vs resolve-time call shape: at create the row's
 // resolvedAt is null, so only the created event is written; at resolve it carries
 // resolvedAt, so the resolved event is written (created is a no-op re-hit).
+// Backlog H: emit the thread_interaction frames live. Both wrappers receive the POOL `db`
+// AFTER their caller's source mutation has committed (create() at ~2047 runs post-tx; every
+// resolution funnels here post-commit too), so flushing the thunks here is post-commit-safe.
+// ponytail: load-bearing invariant — if a caller is ever moved to pass an open `tx`, hoist
+// the flush to that caller's post-commit boundary or it becomes a phantom-on-rollback emit.
 async function emitInteractionCreatedIssueEvent(db: Db, interaction: IssueThreadInteraction) {
-  await appendInteractionRowEvents(db, interaction);
+  const pubs: IssueEventPublication[] = [];
+  await appendInteractionRowEvents(db, interaction, pubs);
+  flushIssueEventPublications(pubs);
 }
 
 async function emitInteractionResolvedIssueEvent(db: Db, interaction: IssueThreadInteraction) {
-  await appendInteractionRowEvents(db, interaction);
+  const pubs: IssueEventPublication[] = [];
+  await appendInteractionRowEvents(db, interaction, pubs);
+  flushIssueEventPublications(pubs);
 }
 
 // Post-resolution side-effects for a resolved interaction. Every SERVICE resolution

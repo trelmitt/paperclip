@@ -110,7 +110,7 @@ import type {
 import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnectionMethod, getConnectableAppDefinition, isToolConnectionAttentionHealth, recommendedDefaultsForApp } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
-import { appendInteractionRowEvents, issueEventsDualWriteEnabled } from "./issue-events.js";
+import { appendInteractionRowEvents, flushIssueEventPublications, issueEventsDualWriteEnabled, type IssueEventPublication } from "./issue-events.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { secretService } from "./secrets.js";
@@ -5578,7 +5578,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         // abandoned connect card would be invisible to the derived reader while
         // work-timeline surfaces it (E3b parity). resolvedAt is null here → created only.
         if (issueEventsDualWriteEnabled()) {
-          await appendInteractionRowEvents(db, interaction);
+          // Backlog H: autocommit `db` — the card write above is durable, emit live post-commit.
+          const pubs: IssueEventPublication[] = [];
+          await appendInteractionRowEvents(db, interaction, pubs);
+          flushIssueEventPublications(pubs);
         }
       }
     }
@@ -5740,7 +5743,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         // Raw resolution (bypasses the service wrappers) — emit the resolved
         // `thread_interaction` event so the reader matches work-timeline (E3b parity).
         if (resolved && issueEventsDualWriteEnabled()) {
-          await appendInteractionRowEvents(db, resolved);
+          // Backlog H: autocommit `db` — the interaction row is durable, emit live post-commit.
+          const pubs: IssueEventPublication[] = [];
+          await appendInteractionRowEvents(db, resolved, pubs);
+          flushIssueEventPublications(pubs);
         }
       }
       const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));

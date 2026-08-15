@@ -132,8 +132,10 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import {
   appendIssueEvent,
+  flushIssueEventPublications,
   issueEventsDualWriteEnabled,
   resolveIssueEventActor,
+  type IssueEventPublication,
 } from "./issue-events.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
@@ -8684,7 +8686,10 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
 
-      return db.transaction(async (tx) => {
+      // Backlog H: pool-owned tx — collect the retraction thunk and flush AFTER commit.
+      // The await below rejects on rollback, so the flush never runs for an aborted tx.
+      const pubs: IssueEventPublication[] = [];
+      const result = await db.transaction(async (tx) => {
         const [comment] = await tx
           .delete(issueComments)
           .where(eq(issueComments.id, commentId))
@@ -8712,11 +8717,13 @@ export function issueService(db: Db) {
             sourceTable: "issue_comments",
             sourceId: comment.id,
             payload: { commentId: comment.id },
-          });
+          }, pubs);
         }
 
         return redactIssueComment(comment, currentUserRedactionOptions.enabled);
       });
+      flushIssueEventPublications(pubs);
+      return result;
     },
 
     tombstoneComment: async (
@@ -8735,7 +8742,11 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
 
-      return db.transaction(async (tx) => {
+      // Backlog H: pool-owned tx — collect the retraction thunk and flush AFTER commit.
+      // The await below rejects on rollback (incl. an afterTombstone throw), so the flush
+      // never runs for an aborted tx.
+      const pubs: IssueEventPublication[] = [];
+      const result = await db.transaction(async (tx) => {
         const now = new Date();
         const [comment] = await tx
           .update(issueComments)
@@ -8779,7 +8790,7 @@ export function issueService(db: Db) {
             sourceTable: "issue_comments",
             sourceId: comment.id,
             payload: { commentId: comment.id },
-          });
+          }, pubs);
         }
 
         const redacted = redactIssueComment(comment, currentUserRedactionOptions.enabled);
@@ -8787,6 +8798,8 @@ export function issueService(db: Db) {
 
         return redacted;
       });
+      flushIssueEventPublications(pubs);
+      return result;
     },
 
     addComment: async (
@@ -8806,8 +8819,20 @@ export function issueService(db: Db) {
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
-      dbOrTx: any = db,
+      dbOrTxArg?: any,
     ) => {
+      // Backlog H: the live `commented` emit is safe ONLY when addComment runs on the
+      // autocommit pool boundary. Detect that by whether the caller OMITTED the handle
+      // (pool-route → autocommit), NOT by identity: issueService(tx) makes the closure
+      // `db` the tx itself, so `dbOrTx === db` is also true for a tx-built service and
+      // would flush a phantom frame inside an open tx (rolled back → comment gone, frame
+      // already sent). Every external-tx caller passes its handle explicitly (decisions.ts,
+      // stalled-review-decisions.ts, execution-workspaces.ts), so the explicit-arg sentinel
+      // reliably defers them to the backfill.
+      // ponytail ceiling: if a future caller builds issueService(tx) AND omits the handle,
+      // this would misfire — pass the tx (you already must, for write atomicity).
+      const ownsAutocommitBoundary = dbOrTxArg === undefined;
+      const dbOrTx: any = dbOrTxArg ?? db;
       const issue = await dbOrTx
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -8878,6 +8903,12 @@ export function issueService(db: Db) {
         // Written on the caller's handle so the row is atomic with the comment; no
         // live emit is passed (rows only in cut-1 — H wires the post-commit feed).
         const eventActor = resolveIssueEventActor(comment.authorAgentId, comment.authorUserId);
+        // Backlog H: emit the `commented` feed frame. On the pool-route (no handle
+        // passed) every statement above autocommitted, so the row is durable — flush
+        // live. Under a caller-supplied handle the outer boundary owns commit, so we skip
+        // the flush (external-tx live emit is deferred to the F backfill). See the
+        // ownsAutocommitBoundary derivation above for why identity can't gate this.
+        const pubs: IssueEventPublication[] = [];
         await appendIssueEvent(dbOrTx, {
           companyId: comment.companyId,
           issueId,
@@ -8893,7 +8924,8 @@ export function issueService(db: Db) {
             authorType: comment.authorType,
           },
           at: comment.createdAt ?? undefined,
-        });
+        }, pubs);
+        if (ownsAutocommitBoundary) flushIssueEventPublications(pubs);
       }
 
       if (

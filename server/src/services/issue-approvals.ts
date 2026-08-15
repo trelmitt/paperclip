@@ -5,9 +5,11 @@ import { notFound, unprocessable } from "../errors.js";
 import { redactEventPayload } from "../redaction.js";
 import {
   appendIssueEvent,
+  flushIssueEventPublications,
   issueEventsDualWriteEnabled,
   resolveApprovalEventActor,
   resolveIssueEventActor,
+  type IssueEventPublication,
 } from "./issue-events.js";
 
 interface LinkActor {
@@ -64,6 +66,10 @@ export function issueApprovalService(db: Db) {
     // source ref is the (issue, approval) link, not the approval — an approval fans
     // out to N issues, so keying on approvalId alone would collide.
     const sourceId = `${issueId}:${approval.id}`;
+    // Backlog H: both callers run this after their autocommit `db` write has committed
+    // (link's insert, linkManyForApproval's insert), so emit live — request and resolve
+    // share one list flushed at the end.
+    const pubs: IssueEventPublication[] = [];
     await appendIssueEvent(db, {
       companyId,
       issueId,
@@ -74,7 +80,7 @@ export function issueApprovalService(db: Db) {
       sourceId,
       payload: { approvalId: approval.id, approvalType: approval.type, status: approval.status },
       at: approval.createdAt ?? undefined,
-    });
+    }, pubs);
     if (approval.decidedAt) {
       const resolvedActor = resolveApprovalEventActor(approval);
       await appendIssueEvent(db, {
@@ -87,8 +93,9 @@ export function issueApprovalService(db: Db) {
         sourceId,
         payload: { approvalId: approval.id, status: approval.status, decisionNote: approval.decisionNote ?? null },
         at: approval.decidedAt ?? undefined,
-      });
+      }, pubs);
     }
+    flushIssueEventPublications(pubs);
   }
 
   return {
@@ -204,6 +211,8 @@ export function issueApprovalService(db: Db) {
       // appendInteractionRowEvents; a documented log-authoritative divergence (see
       // issue-events-timeline.ts KNOWN DIVERGENCES), not chased to byte-identity.
       if (removed && issueEventsDualWriteEnabled()) {
+        // Backlog H: autocommit `db` — the delete above is durable, emit live post-commit.
+        const pubs: IssueEventPublication[] = [];
         await appendIssueEvent(db, {
           companyId: issue.companyId,
           issueId,
@@ -213,7 +222,8 @@ export function issueApprovalService(db: Db) {
           sourceTable: "issue_approvals",
           sourceId: `${issueId}:${approvalId}`,
           payload: { approvalId },
-        });
+        }, pubs);
+        flushIssueEventPublications(pubs);
       }
     },
 

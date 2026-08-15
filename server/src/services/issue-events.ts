@@ -10,6 +10,15 @@ import { publishLiveEvent } from "./live-events.js";
  */
 export type IssueEventPublication = () => void;
 
+/**
+ * Runs the deferred issue.event publish thunks (backlog H). Call this ONLY after the
+ * transaction that wrote the rows has COMMITTED — never inside the tx callback — so a
+ * rolled-back mutation emits nothing. A no-op for an empty list (rows-only / dual-write off).
+ */
+export function flushIssueEventPublications(publications: IssueEventPublication[]): void {
+  for (const publish of publications) publish();
+}
+
 export interface AppendIssueEventInput {
   companyId: string;
   issueId: string;
@@ -142,10 +151,15 @@ export interface InteractionEventRow {
  * re-resolved keeps the FIRST resolution in the log while work-timeline shows the
  * second. Reopen is rare (OAuth only) and closing it needs a retraction event;
  * deferred with the rest of reopen semantics.
+ *
+ * Pass `postCommitPublications` (backlog H) to emit the created/resolved thunks live;
+ * both inner appends share the list, which the caller flushes after commit. Omit it for
+ * rows-only (the E4 backfill). Only newly-written rows queue a thunk (onConflictDoNothing).
  */
 export async function appendInteractionRowEvents(
   dbOrTx: any,
   row: InteractionEventRow,
+  postCommitPublications?: IssueEventPublication[],
 ): Promise<{ createdWritten: boolean; resolvedWritten: boolean }> {
   const createdActor = resolveIssueEventActor(row.createdByAgentId, row.createdByUserId);
   const created = await appendIssueEvent(dbOrTx, {
@@ -160,7 +174,7 @@ export async function appendInteractionRowEvents(
     payload: { interactionId: row.id, interactionKind: row.kind, status: row.status, phase: "created" },
     // Hydrated timestamps are Date | string; coerce (new Date copies a Date, parses a string).
     at: row.createdAt ? new Date(row.createdAt) : undefined,
-  });
+  }, postCommitPublications);
   let resolvedWritten = false;
   if (row.resolvedAt) {
     const resolvedActor = resolveInteractionEventActor(row);
@@ -175,7 +189,7 @@ export async function appendInteractionRowEvents(
       sourceId: `${row.id}:resolved`,
       payload: { interactionId: row.id, interactionKind: row.kind, status: row.status, phase: "resolved" },
       at: row.resolvedAt ? new Date(row.resolvedAt) : undefined,
-    });
+    }, postCommitPublications);
     resolvedWritten = resolved.id !== null;
   }
   return { createdWritten: created.id !== null, resolvedWritten };

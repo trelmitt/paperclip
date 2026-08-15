@@ -5,8 +5,10 @@ import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import {
   appendIssueEvent,
+  flushIssueEventPublications,
   issueEventsDualWriteEnabled,
   resolveApprovalEventActor,
+  type IssueEventPublication,
 } from "./issue-events.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -56,6 +58,9 @@ export function approvalService(db: Db) {
       .where(eq(issueApprovals.approvalId, approval.id));
     if (links.length === 0) return;
     const eventActor = resolveApprovalEventActor(approval);
+    // Backlog H: both callers invoke this AFTER their autocommit `db` update has
+    // committed, so emit live — one shared list flushed once the fan-out is done.
+    const pubs: IssueEventPublication[] = [];
     for (const link of links) {
       await appendIssueEvent(db, {
         companyId: link.companyId,
@@ -71,8 +76,9 @@ export function approvalService(db: Db) {
           decisionNote: approval.decisionNote ?? null,
         },
         at: approval.decidedAt ?? undefined,
-      });
+      }, pubs);
     }
+    flushIssueEventPublications(pubs);
   }
 
   async function resolveApproval(

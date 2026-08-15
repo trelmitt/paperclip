@@ -60,7 +60,9 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
   appendInteractionRowEvents,
   appendIssueEvent,
+  flushIssueEventPublications,
   issueEventsDualWriteEnabled,
+  type IssueEventPublication,
   resolveApprovalEventActor,
 } from "./issue-events.js";
 import {
@@ -1471,7 +1473,10 @@ export function createToolGatewayService(
       .where(eq(issueThreadInteractions.id, linked.interactionId))
       .returning();
     if (resolvesPendingCard && updated && issueEventsDualWriteEnabled()) {
-      await appendInteractionRowEvents(db, updated);
+      // Backlog H: autocommit `db` — the update above is durable, so emit live post-commit.
+      const pubs: IssueEventPublication[] = [];
+      await appendInteractionRowEvents(db, updated, pubs);
+      flushIssueEventPublications(pubs);
     }
   }
 
@@ -1670,6 +1675,8 @@ export function createToolGatewayService(
       // (its resolution is still covered via approvalService's fan-out).
       if (issueEventsDualWriteEnabled()) {
         const eventActor = resolveApprovalEventActor(approval);
+        // Backlog H: autocommit `db` — emit approval_requested live post-commit.
+        const pubs: IssueEventPublication[] = [];
         await appendIssueEvent(db, {
           companyId: input.session.companyId,
           issueId: input.session.issueId,
@@ -1680,7 +1687,8 @@ export function createToolGatewayService(
           sourceId: `${input.session.issueId}:${approval.id}`,
           payload: { approvalId: approval.id, approvalType: approval.type, status: approval.status },
           at: approval.createdAt ?? undefined,
-        });
+        }, pubs);
+        flushIssueEventPublications(pubs);
       }
     }
 

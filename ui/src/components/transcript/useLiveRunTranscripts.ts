@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { LiveEvent } from "@paperclipai/shared";
+import type { HeartbeatRunEvent, LiveEvent } from "@paperclipai/shared";
 import { ApiError } from "../../api/client";
 import { instanceSettingsApi } from "../../api/instanceSettings";
 import { heartbeatsApi } from "../../api/heartbeats";
@@ -39,6 +39,12 @@ const TASK_VIEW_MAX_BYTES_PER_RUN = 2_000_000;
 // and silently drops already-rendered scrollback (PAP-462 B3). A run that is
 // genuinely gone stays absent past this window and is then pruned as before.
 const RUN_ABSENCE_PRUNE_GRACE_MS = 20_000;
+// Reconnect event-replay paging (backlog H). The page size MUST match
+// heartbeatsApi.events' default `limit` so a full page reliably signals "more to
+// fetch". The page cap is a backstop for a pathological outage (~10k events/run);
+// the per-run watermark means a subsequent reconnect resumes where paging stopped.
+const HEARTBEAT_EVENT_PAGE = 200;
+const MAX_CATCHUP_PAGES = 50;
 
 export interface RunTranscriptSource {
   id: string;
@@ -130,6 +136,11 @@ export function useLiveRunTranscripts({
   const pendingLogRowsByRunRef = useRef(new Map<string, string>());
   const logOffsetByRunRef = useRef(new Map<string, number>());
   const missingTerminalLogRunIdsRef = useRef(new Set<string>());
+  // Backlog H: highest heartbeat_run_events.seq applied per run. These event frames
+  // (system/error transcript lines) arrive ONLY over the socket — they are not in the
+  // byte-offset log the fallback poll re-reads — so a reconnect replays them via
+  // heartbeatsApi.events(runId, afterSeq) starting past this watermark.
+  const heartbeatEventSeqByRunRef = useRef(new Map<string, number>());
   // PAP-462 B3: buffered runs that dropped out of the `runs` list, mapped to the
   // wall-clock deadline (ms) after which their buffer may be pruned. A run still
   // inside its grace window is retained across the empty poll; `pruneTick` fires
@@ -262,6 +273,11 @@ export function useLiveRunTranscripts({
         missingTerminalLogRunIdsRef.current.delete(runId);
       }
     }
+    for (const runId of heartbeatEventSeqByRunRef.current.keys()) {
+      if (!retainedRunIds.has(runId)) {
+        heartbeatEventSeqByRunRef.current.delete(runId);
+      }
+    }
     for (const runId of transcriptCacheRef.current.keys()) {
       if (!retainedRunIds.has(runId)) {
         transcriptCacheRef.current.delete(runId);
@@ -347,12 +363,14 @@ export function useLiveRunTranscripts({
     if (!enableRealtimeUpdates) return;
     if (!companyId || activeRunIds.size === 0) return;
 
-    // ponytail: this per-run socket does NOT send backlog F's composite resume
-    // cursor, so heartbeat.run.event frames missed during a reconnect are not
-    // replayed here — the byte-offset log poll (readRunLog) is the catch-up for
-    // the primary log content. Upgrade path: send ?cursor={heartbeat:maxSeq} like
-    // LiveUpdatesProvider and dedupe on the existing per-run `seq` if transcript
-    // system/error lines dropping across reconnects becomes visible.
+    // Reconnect recovery is split by transport (backlog H): log CONTENT is caught
+    // up by the byte-offset poll (readRunLog), and heartbeat.run.event frames are
+    // replayed on (re)open via catchUpHeartbeatEvents (heartbeatsApi.events past the
+    // per-run seq watermark). ponytail: this socket still does NOT send backlog F's
+    // composite ?cursor — the replay is a per-run afterSeq re-read, not a single
+    // server-side resume — which is sufficient because the events endpoint is
+    // idempotent and the live dedupe key is seq-keyed. Upgrade to the composite
+    // cursor only if cross-run ordering across a reconnect ever needs to be exact.
     let closed = false;
     let reconnectTimer: number | null = null;
     let socket: WebSocket | null = null;
@@ -376,6 +394,55 @@ export function useLiveRunTranscripts({
       reconnectTimer = window.setTimeout(connect, delayMs);
     };
 
+    // Backlog H: replay heartbeat_run_events missed while the socket was down. The
+    // fallback log poll re-reads byte-log content on reconnect, but event frames
+    // (system/error transcript lines) live only in heartbeat_run_events, so fetch
+    // them past each run's watermark and append with the SAME dedupe key the live
+    // handler uses — a frame seen both live and in the replay collapses to one.
+    const catchUpHeartbeatEvents = async () => {
+      const seqByRun = heartbeatEventSeqByRunRef.current;
+      await Promise.all(
+        Array.from(activeRunIds).map(async (runId) => {
+          if (!runById.has(runId)) return;
+          // Page through the full backlog: a long outage can drop more than one page
+          // of events, and the events endpoint caps each response at HEARTBEAT_EVENT_PAGE.
+          // A LOCAL cursor drives paging so a concurrent live frame advancing the shared
+          // watermark can't make us skip a page; MAX_CATCHUP_PAGES bounds a pathological
+          // run (the next reconnect resumes from the watermark if we ever hit it).
+          let cursor = seqByRun.get(runId) ?? 0;
+          for (let page = 0; page < MAX_CATCHUP_PAGES; page += 1) {
+            let events: HeartbeatRunEvent[];
+            try {
+              events = await heartbeatsApi.events(runId, cursor, HEARTBEAT_EVENT_PAGE);
+            } catch {
+              return;
+            }
+            if (closed || events.length === 0) return;
+            let maxSeq = cursor;
+            const chunks = events.map((ev): RunLogChunk & { dedupeKey: string } => {
+              if (ev.seq > maxSeq) maxSeq = ev.seq;
+              const eventType = ev.eventType || "event";
+              const messageText = readString(ev.message) ?? eventType;
+              return {
+                ts: new Date(ev.createdAt).toISOString(),
+                stream: eventType === "error" ? "stderr" : "system",
+                chunk: messageText,
+                dedupeKey: `socket:event:${runId}:${ev.seq}`,
+              };
+            });
+            appendChunks(runId, chunks);
+            // Advance the shared watermark monotonically — never below a value a
+            // concurrent live frame may already have set.
+            const current = seqByRun.get(runId) ?? 0;
+            if (maxSeq > current) seqByRun.set(runId, maxSeq);
+            cursor = maxSeq;
+            // A short page means the backlog is drained for this run.
+            if (events.length < HEARTBEAT_EVENT_PAGE) return;
+          }
+        }),
+      );
+    };
+
     const connect = () => {
       if (closed) return;
       const url = buildSameOriginWebSocketUrl(
@@ -385,7 +452,12 @@ export function useLiveRunTranscripts({
 
       socket.onopen = () => {
         if (closed) return;
+        // A non-zero attempt means we just recovered from a dropped connection
+        // (scheduleReconnect bumped it), so catch up the events missed while down.
+        // The very first connect (attempt 0) is covered by the initial readAll.
+        const isReconnect = reconnectState.attempt > 0;
         reconnectState.attempt = 0;
+        if (isReconnect) void catchUpHeartbeatEvents();
       };
 
       socket.onmessage = (message) => {
@@ -429,6 +501,13 @@ export function useLiveRunTranscripts({
           const seq = typeof payload["seq"] === "number" ? payload["seq"] : null;
           const eventType = readString(payload["eventType"]) ?? "event";
           const messageText = readString(payload["message"]) ?? eventType;
+          // Backlog H: advance the per-run watermark so a reconnect only re-reads
+          // frames past the last one applied live.
+          if (seq !== null) {
+            const seqByRun = heartbeatEventSeqByRunRef.current;
+            const prevSeq = seqByRun.get(runId) ?? 0;
+            if (seq > prevSeq) seqByRun.set(runId, seq);
+          }
           appendChunks(runId, [{
             ts: event.createdAt,
             stream: eventType === "error" ? "stderr" : "system",
