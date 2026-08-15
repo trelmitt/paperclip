@@ -277,7 +277,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
-import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import { extractSkillMentionIds, isUuidLike, LIVE_STREAM_HEARTBEAT } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -9655,22 +9655,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       at: eventAt,
     });
 
-    await db.insert(heartbeatRunEvents).values({
-      companyId: run.companyId,
-      runId: run.id,
-      agentId: run.agentId,
-      seq,
-      eventType: event.eventType,
-      stream: event.stream,
-      level: event.level,
-      color: event.color,
-      message: sanitizedMessage,
-      payload: sanitizedPayload,
-    });
+    const [insertedRunEvent] = await db
+      .insert(heartbeatRunEvents)
+      .values({
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        seq,
+        eventType: event.eventType,
+        stream: event.stream,
+        level: event.level,
+        color: event.color,
+        message: sanitizedMessage,
+        payload: sanitizedPayload,
+      })
+      .returning({ id: heartbeatRunEvents.id });
 
     publishLiveEvent({
       companyId: run.companyId,
       type: "heartbeat.run.event",
+      // Backlog F: heartbeat_run_events.id (global bigserial) is the "heartbeat" stream
+      // resume cursor — one company-wide backfill (WHERE id > seq) catches up every run's
+      // events at once. Distinct from payload.seq below, which is the PER-RUN order key the
+      // per-run transcript consumer + item-A's afterSeq endpoint use.
+      stream: LIVE_STREAM_HEARTBEAT,
+      seq: insertedRunEvent?.id ?? null,
       payload: {
         runId: run.id,
         agentId: run.agentId,

@@ -1347,3 +1347,42 @@ describe("dispatchLiveEventToSubscribers", () => {
     expect(received).toEqual(["still-called"]);
   });
 });
+
+describe("advanceResumeCursor (backlog F resume cursor)", () => {
+  const { advanceResumeCursor } = __liveUpdatesTestUtils;
+  const frame = (over: Record<string, unknown>) => ({
+    id: 1,
+    companyId: "c1",
+    type: "issue.event",
+    createdAt: "2026-08-14T00:00:00.000Z",
+    payload: {},
+    stream: null,
+    seq: null,
+    ...over,
+  });
+
+  it("advances the high-water mark for a durable frame", () => {
+    expect(advanceResumeCursor({}, frame({ stream: "issue", seq: 42 }) as never)).toEqual({ issue: 42 });
+  });
+
+  it("keeps the max and never regresses on an out-of-order lower seq", () => {
+    // The whole point: an out-of-order commit (seq 41 arriving after 42) must NOT be treated
+    // as a duplicate — advanceResumeCursor cannot drop, it only reports the cursor, which stays
+    // at the max so the next reconnect resumes from there. The caller processes both frames.
+    expect(advanceResumeCursor({ issue: 42 }, frame({ stream: "issue", seq: 41 }) as never)).toEqual({ issue: 42 });
+    expect(advanceResumeCursor({ issue: 42 }, frame({ stream: "issue", seq: 42 }) as never)).toEqual({ issue: 42 });
+  });
+
+  it("tracks streams independently", () => {
+    expect(advanceResumeCursor({ issue: 42 }, frame({ stream: "heartbeat", seq: 5 }) as never)).toEqual({
+      issue: 42,
+      heartbeat: 5,
+    });
+  });
+
+  it("leaves the cursor unchanged for a stateless frame", () => {
+    expect(advanceResumeCursor({ issue: 42 }, frame({ type: "agent.status", stream: null, seq: null }) as never)).toEqual({
+      issue: 42,
+    });
+  });
+});

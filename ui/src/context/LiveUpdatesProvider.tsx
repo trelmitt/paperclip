@@ -11,6 +11,7 @@ import { useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@
 import { createCoalescingQueryClient, createInvalidationBatcher } from "../lib/query-invalidation-batcher";
 import { patchRunStatusInList, removeRunFromList } from "../lib/live-runs-cache";
 import type { Agent, HeartbeatRun, Issue, IssueComment, LiveEvent } from "@paperclipai/shared";
+import { encodeLiveCursor, mergeLiveCursor, type LiveCursor } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
@@ -1262,6 +1263,23 @@ function handleLiveEvent(
   }
 }
 
+/**
+ * Advance the backlog F resume cursor for one incoming frame: the max durable seq seen per
+ * stream, sent as ?cursor= on the next reconnect. A stateless frame (no stream/seq) leaves it
+ * unchanged.
+ *
+ * Deliberately NEVER drops a frame. bigserial ids become visible at commit, not at allocation,
+ * so under concurrent writers a lower seq can legitimately arrive AFTER a higher one — a
+ * `seq <= seen` "already delivered" test would silently discard that genuinely-new event on the
+ * live path (and it would run even with server resume off). Consumers here are idempotent and
+ * the server's replay->live seam dedupes by exact membership, so every frame is processed and a
+ * duplicate — which does not occur in normal operation — would be harmless.
+ */
+function advanceResumeCursor(cursor: LiveCursor, event: LiveEvent): LiveCursor {
+  const { stream, seq } = event;
+  return stream && typeof seq === "number" ? mergeLiveCursor(cursor, stream, seq) : cursor;
+}
+
 function resolveLiveCompanyId(
   selectedCompanyId: string | null,
   selectedCompanyLiveId: string | null,
@@ -1316,6 +1334,7 @@ export const __liveUpdatesTestUtils = {
   invalidateVisibleIssueRunQueries,
   readRunLiveStatusPatchFromPayload,
   resolveLiveCompanyId,
+  advanceResumeCursor,
   shouldDeferIssueRefetchForVisibleAgentActivity,
   shouldDeferVisibleIssueCommentActivity,
   shouldSuppressActivityToastForVisibleIssue,
@@ -1380,6 +1399,12 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
     let reconnectAttempt = 0;
     let reconnectTimer: number | null = null;
     let socket: WebSocket | null = null;
+    // Backlog F — composite resume cursor: the max durable seq seen per stream
+    // (issue_events.id under "issue", heartbeat_run_events.id under "heartbeat").
+    // Sent as ?cursor= on every (re)connect so the server can replay the frames
+    // missed while disconnected. Per-effect (per company/session) — a company
+    // switch re-runs the effect and starts fresh, as the streams are per-company.
+    let cursor: LiveCursor = {};
 
     const clearReconnect = () => {
       if (reconnectTimer !== null) {
@@ -1400,8 +1425,12 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
 
     const connect = () => {
       if (closed) return;
+      const basePath = `/api/companies/${encodeURIComponent(liveCompanyId)}/events/ws`;
+      // base64url token (query-safe charset) — omit when empty so a first connect
+      // sends no cursor. Ignored server-side unless PAPERCLIP_LIVE_RESUME is on.
+      const cursorToken = Object.keys(cursor).length > 0 ? encodeLiveCursor(cursor) : null;
       const url = buildSameOriginWebSocketUrl(
-        `/api/companies/${encodeURIComponent(liveCompanyId)}/events/ws`,
+        cursorToken ? `${basePath}?cursor=${cursorToken}` : basePath,
       );
       const nextSocket = new WebSocket(url);
       socket = nextSocket;
@@ -1413,9 +1442,15 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
         }
         if (reconnectAttempt > 0) {
           gateRef.current.suppressUntil = Date.now() + RECONNECT_SUPPRESS_MS;
-          // Reconcile after a gap: events missed while disconnected can't be
-          // replayed yet, so refetch the event-sourced live-runs list once.
+          // Reconcile after a gap. Backlog F replays the durable streams
+          // (issue/heartbeat) from the resume cursor when server-side resume is
+          // on, but the class-3 stateless projections (runs list, agent status,
+          // activity feed) have no cursor and can't be replayed — refetch them
+          // once here. Cheap: this runs per reconnect, not per event.
           queryClient.invalidateQueries({ queryKey: queryKeys.liveRuns(liveCompanyId) });
+          queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(liveCompanyId) });
+          queryClient.invalidateQueries({ queryKey: queryKeys.activity(liveCompanyId) });
+          queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(liveCompanyId) });
         }
         reconnectAttempt = 0;
       };
@@ -1426,6 +1461,10 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
 
         try {
           const parsed = JSON.parse(raw) as LiveEvent;
+          // Backlog F — advance the resume cursor (max seq per stream) for the next
+          // reconnect's ?cursor=. Never drops (see advanceResumeCursor): every frame
+          // is processed, so out-of-order bigserial commits are not lost.
+          cursor = advanceResumeCursor(cursor, parsed);
           handleLiveEvent(coalescingClient, liveCompanyId, pathnameRef.current, parsed, pushToast, gateRef.current, {
             userId: currentActorRef.current.userId,
             agentId: currentActorRef.current.agentId,

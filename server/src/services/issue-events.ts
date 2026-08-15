@@ -1,5 +1,5 @@
 import { issueEvents } from "@paperclipai/db";
-import type { IssueEventActorType, IssueEventKind } from "@paperclipai/shared";
+import { LIVE_STREAM_ISSUE, type IssueEventActorType, type IssueEventKind } from "@paperclipai/shared";
 import { publishLiveEvent } from "./live-events.js";
 
 /**
@@ -235,6 +235,10 @@ export async function appendIssueEvent(
       publishLiveEvent({
         companyId: input.companyId,
         type: "issue.event",
+        // Backlog F: the durable resume position. issue_events.id is the "issue" stream
+        // cursor; a reconnecting client backfills issue_events WHERE id > seq.
+        stream: LIVE_STREAM_ISSUE,
+        seq: eventId,
         payload: {
           issueId: input.issueId,
           eventId,

@@ -5,10 +5,11 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { decodeLiveCursor, type DeploymentMode, type LiveCursor, type LiveEvent } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
-import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { backfillLiveStreams, planLiveResumeFlush } from "../services/live-events-backfill.js";
+import { liveResumeEnabled, subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 interface WsSocket {
   readyState: number;
@@ -260,9 +261,31 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    // Backlog F — reconnect resume. When resume is enabled AND the client sent a ?cursor=,
+    // attach the live listener into a BUFFER first, replay the durable backfill from the cursor,
+    // then flush the buffer (dropping only exact (stream, seq) duplicates the backfill delivered)
+    // and go live. Attaching BEFORE the backfill query runs means nothing published during the
+    // query is lost; exact-membership dedupe means nothing is delivered twice at the seam. No
+    // cursor (or resume disabled) = exactly the old behavior: subscribe and stream live.
+    let resumeCursor: LiveCursor = {};
+    if (liveResumeEnabled() && req.url) {
+      try {
+        resumeCursor = decodeLiveCursor(new URL(req.url, "http://localhost").searchParams.get("cursor"));
+      } catch {
+        resumeCursor = {};
+      }
+    }
+    const resuming = Object.keys(resumeCursor).length > 0;
+
+    const send = (event: LiveEvent) => {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+    };
+
+    let buffering = resuming;
+    const buffer: LiveEvent[] = [];
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      if (buffering) buffer.push(event);
+      else send(event);
     });
 
     cleanupByClient.set(socket, unsubscribe);
@@ -282,6 +305,41 @@ export function setupLiveEventsWebSocketServer(
     socket.on("error", (err: Error) => {
       logger.warn({ err, companyId: context.companyId }, "live websocket client error");
     });
+
+    if (resuming) {
+      void (async () => {
+        try {
+          const { frames, deliveredKeys, truncatedStreams } = await backfillLiveStreams(
+            db,
+            context.companyId,
+            resumeCursor,
+          );
+          if (socket.readyState !== WebSocket.OPEN) return; // closed mid-backfill
+          for (const frame of frames) send(frame);
+          if (truncatedStreams.length > 0) {
+            logger.warn(
+              { companyId: context.companyId, truncatedStreams },
+              "live resume backfill truncated; client should full-refetch",
+            );
+          }
+          // Flush buffered live frames, dropping only exact duplicates the backfill delivered.
+          // Synchronous (no await) so no newly-published frame can interleave before we go live.
+          for (const event of planLiveResumeFlush(buffer, deliveredKeys)) send(event);
+          buffer.length = 0;
+          buffering = false;
+        } catch (err) {
+          logger.warn(
+            { err, companyId: context.companyId },
+            "live resume backfill failed; streaming live without replay",
+          );
+          // Fail open: no backfill frames were sent (the query threw), so flush the raw buffer —
+          // each buffered frame is delivered exactly once and live streaming continues.
+          for (const event of buffer) send(event);
+          buffer.length = 0;
+          buffering = false;
+        }
+      })();
+    }
   });
 
   wss.on("close", () => {

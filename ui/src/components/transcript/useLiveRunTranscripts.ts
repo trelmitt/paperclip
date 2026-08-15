@@ -347,6 +347,12 @@ export function useLiveRunTranscripts({
     if (!enableRealtimeUpdates) return;
     if (!companyId || activeRunIds.size === 0) return;
 
+    // ponytail: this per-run socket does NOT send backlog F's composite resume
+    // cursor, so heartbeat.run.event frames missed during a reconnect are not
+    // replayed here — the byte-offset log poll (readRunLog) is the catch-up for
+    // the primary log content. Upgrade path: send ?cursor={heartbeat:maxSeq} like
+    // LiveUpdatesProvider and dedupe on the existing per-run `seq` if transcript
+    // system/error lines dropping across reconnects becomes visible.
     let closed = false;
     let reconnectTimer: number | null = null;
     let socket: WebSocket | null = null;

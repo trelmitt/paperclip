@@ -599,6 +599,17 @@ export {
 } from "./constants.js";
 
 export type { IssueEvent } from "./types/issue-event.js";
+
+export {
+  LIVE_STREAM_ISSUE,
+  LIVE_STREAM_HEARTBEAT,
+  RESUMABLE_LIVE_EVENT_TYPES,
+  isResumableLiveEventType,
+  mergeLiveCursor,
+  encodeLiveCursor,
+  decodeLiveCursor,
+} from "./live-cursor.js";
+export type { LiveCursor } from "./live-cursor.js";
 export {
   issueEventKindSchema,
   issueEventActorTypeSchema,

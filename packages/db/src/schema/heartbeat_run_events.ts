@@ -23,6 +23,8 @@ export const heartbeatRunEvents = pgTable(
     runSeqIdx: index("heartbeat_run_events_run_seq_idx").on(table.runId, table.seq),
     companyRunIdx: index("heartbeat_run_events_company_run_idx").on(table.companyId, table.runId),
     companyCreatedIdx: index("heartbeat_run_events_company_created_idx").on(table.companyId, table.createdAt),
+    // Backlog F: the company-scoped gap-free reconnect backfill scans WHERE company_id=? AND id>cursor.
+    companyIdIdx: index("heartbeat_run_events_company_id_id_idx").on(table.companyId, table.id),
   }),
 );
 
