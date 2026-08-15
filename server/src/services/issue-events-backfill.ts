@@ -1,7 +1,15 @@
 import { and, asc, eq, gt, isNull, like, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, approvals, issueApprovals, issueComments, issues } from "@paperclipai/db";
 import {
+  activityLog,
+  approvals,
+  issueApprovals,
+  issueComments,
+  issueThreadInteractions,
+  issues,
+} from "@paperclipai/db";
+import {
+  appendInteractionRowEvents,
   appendIssueEvent,
   resolveApprovalEventActor,
   resolveIssueEventActor,
@@ -27,18 +35,20 @@ import {
  * their transition history is unrecoverable from the current issue row. The
  * ACTIVITY-LOG-sourced `assignee_changed` (source_table="activity_log") IS
  * backfilled — it is the `assigned` parity signal and is source-bearing/idempotent.
- * Thread-interaction (`approved`) backfill is deferred with E3b.
  */
 export type IssueEventsBackfillResult = {
   scannedIssues: number;
   scannedComments: number;
   scannedApprovalLinks: number;
   scannedAssignLogs: number;
+  scannedInteractions: number;
   created: number;
   commented: number;
   approvalRequested: number;
   approvalResolved: number;
   assigned: number;
+  interactionCreated: number;
+  interactionResolved: number;
 };
 
 const DEFAULT_BATCH_SIZE = 500;
@@ -54,11 +64,14 @@ export async function backfillIssueEvents(
     scannedComments: 0,
     scannedApprovalLinks: 0,
     scannedAssignLogs: 0,
+    scannedInteractions: 0,
     created: 0,
     commented: 0,
     approvalRequested: 0,
     approvalResolved: 0,
     assigned: 0,
+    interactionCreated: 0,
+    interactionResolved: 0,
   };
 
   // 1) created — one per issue. Not part of work-timeline parity (its events array
@@ -269,6 +282,45 @@ export async function backfillIssueEvents(
     result.scannedAssignLogs += rows.length;
     assignCursor = rows[rows.length - 1]!.id;
     log(`assigned: scanned ${result.scannedAssignLogs} assign logs, wrote ${result.assigned}`);
+    if (rows.length < batchSize) break;
+  }
+
+  // 5) thread interactions (`approved`) — one `thread_interaction` at creation
+  // (creator @createdAt) and, when resolved, one at resolution
+  // (resolveInteractionEventActor @resolvedAt). The derived reader collapses the
+  // pair to a single `approved`. Keyed on the interaction id with `:created` /
+  // `:resolved` suffixes -> idempotent, no collision.
+  let interactionCursor: string | null = null;
+  for (;;) {
+    const rows = await db
+      .select({
+        id: issueThreadInteractions.id,
+        companyId: issueThreadInteractions.companyId,
+        issueId: issueThreadInteractions.issueId,
+        kind: issueThreadInteractions.kind,
+        status: issueThreadInteractions.status,
+        createdByAgentId: issueThreadInteractions.createdByAgentId,
+        createdByUserId: issueThreadInteractions.createdByUserId,
+        sourceRunId: issueThreadInteractions.sourceRunId,
+        createdAt: issueThreadInteractions.createdAt,
+        resolvedByAgentId: issueThreadInteractions.resolvedByAgentId,
+        resolvedByUserId: issueThreadInteractions.resolvedByUserId,
+        resolvedByRunId: issueThreadInteractions.resolvedByRunId,
+        resolvedAt: issueThreadInteractions.resolvedAt,
+      })
+      .from(issueThreadInteractions)
+      .where(interactionCursor === null ? undefined : gt(issueThreadInteractions.id, interactionCursor))
+      .orderBy(asc(issueThreadInteractions.id))
+      .limit(batchSize);
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      const { createdWritten, resolvedWritten } = await appendInteractionRowEvents(db, row);
+      if (createdWritten) result.interactionCreated += 1;
+      if (resolvedWritten) result.interactionResolved += 1;
+    }
+    result.scannedInteractions += rows.length;
+    interactionCursor = rows[rows.length - 1]!.id;
+    log(`interactions: scanned ${result.scannedInteractions}, wrote ${result.interactionCreated} created / ${result.interactionResolved} resolved`);
     if (rows.length < batchSize) break;
   }
 

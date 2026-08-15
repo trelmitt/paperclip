@@ -18,12 +18,21 @@ import type { WorkTimelineEvent } from "@paperclipai/shared";
  *     E2's lifecycle `assignee_changed` (null source, issue-row-diff semantics) is
  *     deliberately NOT read here — only the activity-log-sourced rows are the
  *     `assigned` signal, exactly mirroring work-timeline's activity-log read.
+ *   - approved  (thread_interaction created/resolved) — one per interaction,
+ *     collapsed like approvals: the resolved event wins (resolver @resolvedAt) once
+ *     present, else the creation stands (creator @createdAt).
  *
- * KNOWN GAP (the parity test pins it): `approved` from thread interactions is
- * deferred with E3b, so interaction-only `approved` events are absent here.
+ * The reader now covers all four of work-timeline's derived event kinds.
  */
 
-const KINDS = ["created", "commented", "approval_requested", "approval_resolved", "assignee_changed"] as const;
+const KINDS = [
+  "created",
+  "commented",
+  "approval_requested",
+  "approval_resolved",
+  "assignee_changed",
+  "thread_interaction",
+] as const;
 
 // Match work-timeline's actorId encoding (work-timeline.ts:86): `${type}:${id}`.
 // For `assigned`, work-timeline uses the raw activity-log actorId even when the
@@ -65,6 +74,11 @@ export async function deriveWorkTimelineEventsFromLog(
   // once present (decider actor, decidedAt), else the request stands (requester
   // actor, createdAt). Keyed on sourceId (`${issueId}:${approvalId}`).
   const approvalPair = new Map<string, { requested?: typeof rows[number]; resolved?: typeof rows[number] }>();
+  // Same collapse for thread interactions (E3b): keyed on the interaction id, the
+  // created event pairs with the resolved event (source_id `<id>:created` /
+  // `<id>:resolved`). Resolved wins once present, mirroring work-timeline's single
+  // `approved` per interaction (resolver??creator, resolvedAt??createdAt).
+  const interactionPair = new Map<string, { created?: typeof rows[number]; resolved?: typeof rows[number] }>();
 
   for (const row of rows) {
     if (row.kind === "created") {
@@ -101,6 +115,16 @@ export async function deriveWorkTimelineEventsFromLog(
       if (row.kind === "approval_requested") pair.requested = row;
       else pair.resolved = row;
       approvalPair.set(key, pair);
+    } else if (row.kind === "thread_interaction") {
+      // sourceId is `<interactionId>:created` or `<interactionId>:resolved`.
+      const sourceId = row.sourceId ?? "";
+      const sep = sourceId.lastIndexOf(":");
+      const interactionId = sep === -1 ? sourceId : sourceId.slice(0, sep);
+      const phase = sep === -1 ? "" : sourceId.slice(sep + 1);
+      const pair = interactionPair.get(interactionId) ?? {};
+      if (phase === "resolved") pair.resolved = row;
+      else pair.created = row;
+      interactionPair.set(interactionId, pair);
     }
   }
 
@@ -112,6 +136,22 @@ export async function deriveWorkTimelineEventsFromLog(
     const requestedIn = pair.requested ? inWindow(pair.requested.createdAt, input.from, input.to) : false;
     const resolvedIn = pair.resolved ? inWindow(pair.resolved.createdAt, input.from, input.to) : false;
     if (!requestedIn && !resolvedIn) continue;
+    events.push({
+      actorId: encodeActor(chosen.actorType, chosen.actorId),
+      kind: "approved",
+      issueId: chosen.issueId,
+      at: chosen.createdAt.toISOString(),
+    });
+  }
+
+  for (const pair of interactionPair.values()) {
+    const chosen = pair.resolved ?? pair.created;
+    if (!chosen) continue;
+    // work-timeline includes the interaction if its creation OR resolution falls in
+    // the window (interactions source query: `or(createdAt in window, resolvedAt in window)`).
+    const createdIn = pair.created ? inWindow(pair.created.createdAt, input.from, input.to) : false;
+    const resolvedIn = pair.resolved ? inWindow(pair.resolved.createdAt, input.from, input.to) : false;
+    if (!createdIn && !resolvedIn) continue;
     events.push({
       actorId: encodeActor(chosen.actorType, chosen.actorId),
       kind: "approved",

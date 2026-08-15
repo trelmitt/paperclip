@@ -58,6 +58,7 @@ import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remot
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
+  appendInteractionRowEvents,
   appendIssueEvent,
   issueEventsDualWriteEnabled,
   resolveApprovalEventActor,
@@ -1445,12 +1446,15 @@ export function createToolGatewayService(
     if (!outcome) return;
 
     const now = new Date();
-    await db
+    // A pending card TTL-expiring here resolves it via a raw update (no service
+    // wrapper), so mirror the resolved `thread_interaction` event ourselves or the
+    // derived reader would stay at the created event's timestamp while work-timeline
+    // reads resolvedAt (E3b parity). Other reflect calls only annotate result.
+    const resolvesPendingCard = input.status === "expired" && interaction.status === "pending";
+    const [updated] = await db
       .update(issueThreadInteractions)
       .set({
-        ...(input.status === "expired" && interaction.status === "pending"
-          ? { status: "expired", resolvedAt: now }
-          : {}),
+        ...(resolvesPendingCard ? { status: "expired", resolvedAt: now } : {}),
         result: {
           ...(currentResult ?? { version: 1, outcome }),
           toolAction: {
@@ -1464,7 +1468,11 @@ export function createToolGatewayService(
         } as unknown as NonNullable<typeof issueThreadInteractions.$inferInsert.result>,
         updatedAt: now,
       })
-      .where(eq(issueThreadInteractions.id, linked.interactionId));
+      .where(eq(issueThreadInteractions.id, linked.interactionId))
+      .returning();
+    if (resolvesPendingCard && updated && issueEventsDualWriteEnabled()) {
+      await appendInteractionRowEvents(db, updated);
+    }
   }
 
   async function approvalRequiredInstructions(issueId: string): Promise<string> {

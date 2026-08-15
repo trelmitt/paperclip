@@ -58,6 +58,10 @@ import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { logActivity } from "./activity-log.js";
+import {
+  appendInteractionRowEvents,
+  issueEventsDualWriteEnabled,
+} from "./issue-events.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 import {
@@ -804,6 +808,47 @@ async function emitResolvedInteractionsTelemetry(
   ));
 }
 
+// Backlog E3b: dual-write the interaction `approved` parity source. work-timeline
+// collapses each interaction to one `approved` (resolver??creator,
+// resolvedAt??createdAt); the pairing convention + actor precedence live in
+// appendInteractionRowEvents (issue-events.ts) so the service, the backfill, and
+// the raw writers in tool-gateway.ts / tool-access.ts all agree. These two wrappers
+// keep the service's create-time vs resolve-time call shape: at create the row's
+// resolvedAt is null, so only the created event is written; at resolve it carries
+// resolvedAt, so the resolved event is written (created is a no-op re-hit).
+async function emitInteractionCreatedIssueEvent(db: Db, interaction: IssueThreadInteraction) {
+  await appendInteractionRowEvents(db, interaction);
+}
+
+async function emitInteractionResolvedIssueEvent(db: Db, interaction: IssueThreadInteraction) {
+  await appendInteractionRowEvents(db, interaction);
+}
+
+// Post-resolution side-effects for a resolved interaction. Every SERVICE resolution
+// path funnels through one of these two wrappers (they replace the direct telemetry
+// calls), so the resolved `thread_interaction` event covers all of accept / reject
+// / cancel / withdraw / expire-stale / supersede / item-verdicts without touching
+// telemetry's own gating. Resolutions that bypass the service with a raw db.update
+// (tool-gateway TTL expiry, tool-access OAuth connect) call appendInteractionRowEvents
+// directly at their own sites instead.
+async function afterInteractionResolved(
+  db: Db,
+  interaction: IssueThreadInteraction,
+  args?: { createdTaskCount?: number; creatorRoleByAgentId?: ReadonlyMap<string, string | null> },
+) {
+  if (issueEventsDualWriteEnabled()) await emitInteractionResolvedIssueEvent(db, interaction);
+  // `return` (not `await`) keeps this off the `await emit…Telemetry(` shape the
+  // call-site rewrite targets, so the wrapper never rewrites into itself.
+  return emitInteractionResolvedTelemetry(db, interaction, args);
+}
+
+async function afterResolvedInteractions(db: Db, interactions: readonly IssueThreadInteraction[]) {
+  if (issueEventsDualWriteEnabled()) {
+    for (const interaction of interactions) await emitInteractionResolvedIssueEvent(db, interaction);
+  }
+  return emitResolvedInteractionsTelemetry(db, interactions);
+}
+
 function isCommentAtOrAfterInteraction(args: {
   commentCreatedAt: Date | string;
   interactionCreatedAt: Date | string;
@@ -1186,7 +1231,7 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
   }
   await touchIssue(db, args.row.issueId);
   const expired = hydrateInteraction(updated);
-  await emitInteractionResolvedTelemetry(db, expired);
+  await afterInteractionResolved(db, expired);
   return expired;
 }
 
@@ -1436,7 +1481,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         continuationIssue,
       };
     });
-    await emitInteractionResolvedTelemetry(db, result.interaction);
+    await afterInteractionResolved(db, result.interaction);
     return result;
   }
 
@@ -1487,7 +1532,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
     }
     await touchIssue(db, args.issue.id);
     const rejected = hydrateInteraction(updated);
-    await emitInteractionResolvedTelemetry(db, rejected);
+    await afterInteractionResolved(db, rejected);
     return rejected;
   }
 
@@ -1698,7 +1743,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       for (const issueId of new Set(cancelled.map((interaction) => interaction.issueId))) {
         await touchIssue(db, issueId);
       }
-      await emitResolvedInteractionsTelemetry(db, cancelled);
+      await afterResolvedInteractions(db, cancelled);
       return cancelled;
     },
 
@@ -1774,7 +1819,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         for (const issueId of new Set(expired.map((interaction) => interaction.issueId))) {
           await touchIssue(db, issueId);
         }
-        await emitResolvedInteractionsTelemetry(db, expired);
+        await afterResolvedInteractions(db, expired);
       }
       return { expired: expired.length };
     },
@@ -1995,9 +2040,13 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       await touchIssue(db, issue.id);
       if (superseded.length > 0) {
-        await emitResolvedInteractionsTelemetry(db, superseded.map(hydrateInteraction));
+        await afterResolvedInteractions(db, superseded.map(hydrateInteraction));
       }
-      return hydrateInteraction(created);
+      const hydratedCreated = hydrateInteraction(created);
+      if (issueEventsDualWriteEnabled()) {
+        await emitInteractionCreatedIssueEvent(db, hydratedCreated);
+      }
+      return hydratedCreated;
     },
 
     acceptInteraction: async (
@@ -2193,7 +2242,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       });
 
       const accepted = hydrateInteraction(current);
-      await emitInteractionResolvedTelemetry(db, accepted, {
+      await afterInteractionResolved(db, accepted, {
         createdTaskCount: createdWakeTargets.length,
       });
       return {
@@ -2324,7 +2373,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       });
 
       if (submission.resolved) {
-        await emitInteractionResolvedTelemetry(db, submission.interaction);
+        await afterInteractionResolved(db, submission.interaction);
       }
       return submission;
     },
@@ -2373,7 +2422,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       await touchIssue(db, issue.id);
       const rejected = hydrateInteraction(updated);
-      await emitInteractionResolvedTelemetry(db, rejected);
+      await afterInteractionResolved(db, rejected);
       return rejected;
     },
 
@@ -2434,7 +2483,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       if (expired.length > 0) {
         await touchIssue(db, issue.id);
-        await emitResolvedInteractionsTelemetry(db, expired);
+        await afterResolvedInteractions(db, expired);
       }
       return expired;
     },
@@ -2576,7 +2625,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       if (expired.length > 0) {
         await touchIssue(db, issue.id);
-        await emitResolvedInteractionsTelemetry(db, expired);
+        await afterResolvedInteractions(db, expired);
       }
       return expired;
     },
@@ -2648,7 +2697,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       if (expired.length > 0) {
         await touchIssue(db, issue.id);
-        await emitResolvedInteractionsTelemetry(db, expired);
+        await afterResolvedInteractions(db, expired);
       }
       return expired;
     },
@@ -2711,7 +2760,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       }
       if (expired.length > 0) {
         await touchIssue(db, issue.id);
-        await emitResolvedInteractionsTelemetry(db, expired);
+        await afterResolvedInteractions(db, expired);
       }
       return expired;
     },
@@ -2785,7 +2834,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       await touchIssue(db, issue.id);
       const withdrawn = hydrateInteraction(updated);
-      await emitInteractionResolvedTelemetry(db, withdrawn);
+      await afterInteractionResolved(db, withdrawn);
       return withdrawn;
     },
 
@@ -2847,7 +2896,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       await touchIssue(db, issue.id);
       const answered = hydrateInteraction(updated);
-      await emitInteractionResolvedTelemetry(db, answered);
+      await afterInteractionResolved(db, answered);
       return answered;
     },
 
@@ -2906,7 +2955,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       await touchIssue(db, issue.id);
       const cancelled = hydrateInteraction(updated);
-      await emitInteractionResolvedTelemetry(db, cancelled);
+      await afterInteractionResolved(db, cancelled);
       return cancelled;
     },
   };

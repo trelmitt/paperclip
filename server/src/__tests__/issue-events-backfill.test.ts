@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { activityLog, approvals as approvalsTable, issueApprovals, issueComments, issueEvents, issues } from "@paperclipai/db";
+import {
+  activityLog,
+  approvals as approvalsTable,
+  issueApprovals,
+  issueComments,
+  issueEvents,
+  issueThreadInteractions,
+  issues,
+} from "@paperclipai/db";
 import { approvalService } from "../services/approvals.js";
 import { issueApprovalService } from "../services/issue-approvals.js";
 import { backfillIssueEvents } from "../services/issue-events-backfill.js";
+import { deriveWorkTimelineEventsFromLog } from "../services/issue-events-timeline.js";
 import {
   describeEmbeddedPostgres,
   resetCompanyIssueFixtures,
@@ -92,15 +101,68 @@ describeEmbeddedPostgres("issue_events historical backfill", () => {
       entityId: randomUUID(), // no such issue
     });
 
+    // A resolved thread interaction on A — the backfill must emit BOTH a
+    // `thread_interaction` created event (creator @createdAt) and a resolved one
+    // (resolver @resolvedAt), which the reader collapses to one `approved`.
+    const interactionCreatedAt = new Date("2026-01-01T00:00:00.000Z");
+    const interactionResolvedAt = new Date("2026-01-02T00:00:00.000Z");
+    const [interaction] = await ctx.db
+      .insert(issueThreadInteractions)
+      .values({
+        companyId,
+        issueId: issueA,
+        kind: "request_confirmation",
+        status: "accepted",
+        payload: { version: 1, prompt: "Proceed?" },
+        createdByUserId: userId,
+        resolvedByUserId: "interaction-resolver",
+        createdAt: interactionCreatedAt,
+        resolvedAt: interactionResolvedAt,
+      })
+      .returning({ id: issueThreadInteractions.id });
+
     const first = await backfillIssueEvents(ctx.db, { batchSize: 1 });
     expect(first.created).toBeGreaterThanOrEqual(2);
     expect(first.commented).toBeGreaterThanOrEqual(1);
     expect(first.approvalRequested).toBe(2);
     expect(first.approvalResolved).toBe(2);
     expect(first.assigned).toBe(1); // orphan row skipped by the issues join
+    expect(first.interactionCreated).toBe(1);
+    expect(first.interactionResolved).toBe(1);
 
     const aKinds = (await eventsFor(issueA)).map((r) => r.kind).sort();
-    expect(aKinds).toEqual(["approval_requested", "approval_resolved", "assignee_changed", "commented", "created"]);
+    expect(aKinds).toEqual([
+      "approval_requested",
+      "approval_resolved",
+      "assignee_changed",
+      "commented",
+      "created",
+      "thread_interaction",
+      "thread_interaction",
+    ]);
+    // The pair is keyed on the interaction id with :created / :resolved suffixes.
+    const interactionEvents = (await eventsFor(issueA))
+      .filter((r) => r.kind === "thread_interaction")
+      .map((r) => ({ sourceId: r.sourceId, actorId: r.actorId }));
+    expect(interactionEvents).toEqual(
+      expect.arrayContaining([
+        { sourceId: `${interaction!.id}:created`, actorId: userId },
+        { sourceId: `${interaction!.id}:resolved`, actorId: "interaction-resolver" },
+      ]),
+    );
+
+    // Reader collapse: the created/resolved pair yields ONE `approved`, resolved
+    // wins (resolver actor, at resolvedAt).
+    const derived = await deriveWorkTimelineEventsFromLog(ctx.db, {
+      issueIds: [issueA],
+      from: new Date("2020-01-01T00:00:00.000Z"),
+      to: new Date("2030-01-01T00:00:00.000Z"),
+    });
+    const interactionApproved = derived.filter(
+      (e) => e.kind === "approved" && e.actorId === "user:interaction-resolver",
+    );
+    expect(interactionApproved).toHaveLength(1);
+    expect(interactionApproved[0]!.at).toBe(interactionResolvedAt.toISOString());
     const aAssign = (await eventsFor(issueA)).find((r) => r.kind === "assignee_changed");
     expect(aAssign).toMatchObject({ sourceTable: "activity_log", actorType: "user", actorId: userId });
 
@@ -117,6 +179,14 @@ describeEmbeddedPostgres("issue_events historical backfill", () => {
 
     // Idempotent + resumable: a second full run writes nothing new.
     const second = await backfillIssueEvents(ctx.db, { batchSize: 1 });
-    expect(second).toMatchObject({ created: 0, commented: 0, approvalRequested: 0, approvalResolved: 0, assigned: 0 });
+    expect(second).toMatchObject({
+      created: 0,
+      commented: 0,
+      approvalRequested: 0,
+      approvalResolved: 0,
+      assigned: 0,
+      interactionCreated: 0,
+      interactionResolved: 0,
+    });
   });
 });

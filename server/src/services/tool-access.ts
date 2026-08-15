@@ -110,6 +110,7 @@ import type {
 import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnectionMethod, getConnectableAppDefinition, isToolConnectionAttentionHealth, recommendedDefaultsForApp } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { appendInteractionRowEvents, issueEventsDualWriteEnabled } from "./issue-events.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { secretService } from "./secrets.js";
@@ -5549,6 +5550,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             payload,
             result: null,
             resolvedAt: null,
+            // Reopening a previously-resolved card must clear the resolver, or
+            // work-timeline (which reads resolvedBy* first, regardless of resolvedAt)
+            // keeps attributing the reopened-pending card to the stale resolver.
+            resolvedByAgentId: null,
+            resolvedByUserId: null,
+            resolvedByRunId: null,
             updatedAt: new Date(),
           }).where(eq(issueThreadInteractions.id, existingInteraction.id)).returning()
         : await db.insert(issueThreadInteractions).values({
@@ -5566,6 +5573,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           }).returning();
       if (interaction) {
         await db.update(toolOauthStates).set({ interactionId: interaction.id }).where(eq(toolOauthStates.state, state));
+        // This card is created/reopened via a raw insert/update (not the interaction
+        // service), so emit the `thread_interaction` created event ourselves — else an
+        // abandoned connect card would be invisible to the derived reader while
+        // work-timeline surfaces it (E3b parity). resolvedAt is null here → created only.
+        if (issueEventsDualWriteEnabled()) {
+          await appendInteractionRowEvents(db, interaction);
+        }
       }
     }
 
@@ -5713,7 +5727,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         });
       }
       if (stateRow.interactionId) {
-        await db.update(issueThreadInteractions).set({
+        const [resolved] = await db.update(issueThreadInteractions).set({
           status: "accepted",
           result: { version: 1, outcome: "accepted" },
           resolvedByUserId: stateRow.subjectUserId,
@@ -5722,7 +5736,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         }).where(and(
           eq(issueThreadInteractions.id, stateRow.interactionId),
           eq(issueThreadInteractions.companyId, connection.companyId),
-        ));
+        )).returning();
+        // Raw resolution (bypasses the service wrappers) — emit the resolved
+        // `thread_interaction` event so the reader matches work-timeline (E3b parity).
+        if (resolved && issueEventsDualWriteEnabled()) {
+          await appendInteractionRowEvents(db, resolved);
+        }
       }
       const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));
       if (!application) throw new Error("OAuth connection application was not found");

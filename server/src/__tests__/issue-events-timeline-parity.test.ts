@@ -5,6 +5,7 @@ import { logActivity } from "../services/activity-log.js";
 import { approvalService } from "../services/approvals.js";
 import { issueApprovalService } from "../services/issue-approvals.js";
 import { issueService } from "../services/issues.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { deriveWorkTimelineEventsFromLog } from "../services/issue-events-timeline.js";
 import { workTimelineService } from "../services/work-timeline.js";
 import {
@@ -25,6 +26,7 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
       await db.delete(approvalsTable);
       // Real service calls (issueService.create) + the explicit assign log write
       // activity_log rows that FK companies with no cascade — clear them first.
+      // (issue_thread_interactions cascades from issues, so no explicit delete.)
       await db.delete(activityLog);
       await resetCompanyIssueFixtures(db);
     },
@@ -44,8 +46,8 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
   const key = (e: WorkTimelineEvent) => `${e.at}|${e.kind}|${e.issueId}|${e.actorId}`;
   const norm = (events: WorkTimelineEvent[]) => events.map(key).sort();
 
-  // work-timeline covers four derived event kinds; the log now carries all but
-  // interaction-`approved` (deferred E3b), filtered out of the comparison below.
+  // work-timeline covers four derived event kinds; the log now carries all four,
+  // including interaction-`approved` (E3b) which shares the `approved` kind.
   const WIRED_KINDS = new Set(["created", "commented", "approved", "assigned"]);
 
   it("reproduces created + commented + approved + assigned for a live-written issue set", async () => {
@@ -53,6 +55,7 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
     const issues = issueService(ctx.db);
     const approvals = approvalService(ctx.db);
     const junction = issueApprovalService(ctx.db);
+    const interactions = issueThreadInteractionService(ctx.db);
 
     const issueA = await issues.create(companyId, { title: "Issue A", status: "todo", priority: "medium", createdByUserId: userId });
     const issueB = await issues.create(companyId, { title: "Issue B", status: "todo", priority: "medium", createdByUserId: userId });
@@ -68,6 +71,16 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
     await junction.link(issueA.id, approval.id, { userId });
     await junction.link(issueB.id, approval.id, { userId });
     await approvals.approve(approval.id, "decider-user");
+
+    // A pending thread interaction on A — work-timeline surfaces every interaction
+    // as `approved` (at createdAt, creator actor, no kind/status filter). The live
+    // create hook mirrors it into the log as a `thread_interaction` created event,
+    // which the reader collapses back to the same `approved`.
+    await interactions.create(
+      { id: issueA.id, companyId },
+      { kind: "request_confirmation", payload: { version: 1, prompt: "Proceed?" } },
+      { userId },
+    );
 
     // An assign activity — the exact signal work-timeline derives `assigned` from.
     // The flag-on hook in persistActivity mirrors it into the log.
@@ -100,8 +113,9 @@ describeEmbeddedPostgres("issue_events -> work-timeline parity", () => {
     // Sanity: the fixture actually exercised all four wired kinds.
     const kinds = new Set(expected.map((e) => e.kind));
     expect(kinds).toEqual(new Set(["created", "commented", "approved", "assigned"]));
-    // 2 created + 2 commented + 2 approved (one per fanned-out link) + 1 assigned.
-    expect(expected).toHaveLength(7);
+    // 2 created + 2 commented + 2 approved (fanned-out links) + 1 approved
+    // (interaction) + 1 assigned.
+    expect(expected).toHaveLength(8);
 
     expect(norm(actual)).toEqual(norm(expected));
   });

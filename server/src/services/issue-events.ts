@@ -63,6 +63,101 @@ export function resolveApprovalEventActor(approval: {
 }
 
 /**
+ * Actor for a RESOLVED thread interaction, matching work-timeline's `approved`
+ * precedence (work-timeline.ts:711-720): resolver first (user before agent), then
+ * the creator (agent before user), else system. When an interaction is resolved
+ * administratively (resolvedAt set but no resolvedBy*), this correctly falls
+ * through to the creator — exactly what work-timeline does. The CREATED event
+ * (still pending) instead uses resolveIssueEventActor(createdByAgentId,
+ * createdByUserId), which is the same fall-through with both resolvedBy* null.
+ */
+export function resolveInteractionEventActor(interaction: {
+  resolvedByUserId?: string | null;
+  resolvedByAgentId?: string | null;
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+}): { actorType: IssueEventActorType; actorId: string | null } {
+  if (interaction.resolvedByUserId) return { actorType: "user", actorId: interaction.resolvedByUserId };
+  if (interaction.resolvedByAgentId) return { actorType: "agent", actorId: interaction.resolvedByAgentId };
+  return resolveIssueEventActor(interaction.createdByAgentId, interaction.createdByUserId);
+}
+
+/** The issue_thread_interactions columns {@link appendInteractionRowEvents} reads. */
+export interface InteractionEventRow {
+  id: string;
+  companyId: string;
+  issueId: string;
+  kind: string;
+  status: string;
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+  sourceRunId?: string | null;
+  createdAt?: Date | string | null;
+  resolvedByAgentId?: string | null;
+  resolvedByUserId?: string | null;
+  resolvedByRunId?: string | null;
+  resolvedAt?: Date | string | null;
+}
+
+/**
+ * Emits the `thread_interaction` created event (creator @createdAt) and, once
+ * resolvedAt is set, the resolved event (resolveInteractionEventActor @resolvedAt)
+ * for one issue_thread_interactions row (backlog E3b). The derived reader collapses
+ * the pair to work-timeline's single `approved`.
+ *
+ * Both writes are keyed on the interaction id (`${id}:created` / `${id}:resolved`)
+ * and go through appendIssueEvent's onConflictDoNothing, so it is safe to call at
+ * create time, at resolve time, AND in the backfill — every caller converges on the
+ * same two rows. This is the ONE definition of the pairing convention: the service
+ * hooks, the E4 backfill, and the raw interaction writers in tool-gateway.ts /
+ * tool-access.ts (which bypass the service) all route through here so the live log
+ * has no coverage holes. Rows-only (no live publication) — like the rest of cut-1.
+ *
+ * ponytail: append-only ceiling — a `${id}:resolved` event cannot be rewritten, so
+ * an interaction that is resolved, then REOPENED (tool-access OAuth reconnect), then
+ * re-resolved keeps the FIRST resolution in the log while work-timeline shows the
+ * second. Reopen is rare (OAuth only) and closing it needs a retraction event;
+ * deferred with the rest of reopen semantics.
+ */
+export async function appendInteractionRowEvents(
+  dbOrTx: any,
+  row: InteractionEventRow,
+): Promise<{ createdWritten: boolean; resolvedWritten: boolean }> {
+  const createdActor = resolveIssueEventActor(row.createdByAgentId, row.createdByUserId);
+  const created = await appendIssueEvent(dbOrTx, {
+    companyId: row.companyId,
+    issueId: row.issueId,
+    kind: "thread_interaction",
+    actorType: createdActor.actorType,
+    actorId: createdActor.actorId,
+    actorRunId: row.sourceRunId ?? null,
+    sourceTable: "issue_thread_interactions",
+    sourceId: `${row.id}:created`,
+    payload: { interactionId: row.id, interactionKind: row.kind, status: row.status, phase: "created" },
+    // Hydrated timestamps are Date | string; coerce (new Date copies a Date, parses a string).
+    at: row.createdAt ? new Date(row.createdAt) : undefined,
+  });
+  let resolvedWritten = false;
+  if (row.resolvedAt) {
+    const resolvedActor = resolveInteractionEventActor(row);
+    const resolved = await appendIssueEvent(dbOrTx, {
+      companyId: row.companyId,
+      issueId: row.issueId,
+      kind: "thread_interaction",
+      actorType: resolvedActor.actorType,
+      actorId: resolvedActor.actorId,
+      actorRunId: row.resolvedByRunId ?? null,
+      sourceTable: "issue_thread_interactions",
+      sourceId: `${row.id}:resolved`,
+      payload: { interactionId: row.id, interactionKind: row.kind, status: row.status, phase: "resolved" },
+      at: row.resolvedAt ? new Date(row.resolvedAt) : undefined,
+    });
+    resolvedWritten = resolved.id !== null;
+  }
+  return { createdWritten: created.id !== null, resolvedWritten };
+}
+
+/**
  * Appends one row to the append-only issue_events log (backlog E). No per-issue
  * seq is allocated — the bigserial id is the order key and the F/H replay cursor
  * (design decision Q2).
