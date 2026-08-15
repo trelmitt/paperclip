@@ -34,6 +34,30 @@ export function issueEventsDualWriteEnabled(): boolean {
 }
 
 /**
+ * Read-flip feature flag (backlog E6). Off by default: work-timeline keeps deriving
+ * its `events` array from the 6 source tables. When on, work-timeline reads the four
+ * log-derived kinds (created/commented/approved/assigned) from issue_events instead.
+ *
+ * OPERATIONAL PRECONDITION: the log must be complete before flipping — dual-write on
+ * AND the E4 backfill run — or historical issues (whose events predate the log) drop
+ * out of the timeline. Structural events (`delegated`) and all edges/spans are never
+ * in the log and stay derived from the issue rows regardless of this flag.
+ *
+ * CONTRACT — log-authoritative, NOT byte-identical (E6 review, backlog E). The log is
+ * an append-only point-in-time record; work-timeline RE-DERIVES from mutable rows, so it
+ * silently reflects later mutations the frozen log cannot. This reader matches the
+ * 6-table derivation on the common case — including genuine deletions (comment delete /
+ * approval unlink emit `comment_removed` / `approval_unlinked` retractions it honors) —
+ * and where they diverge, the LOG is the authoritative record and the mutable view is the
+ * lossy one. Chasing byte-identity across every mutation site is an unbounded treadmill
+ * (each is a divergence with no compile-time guard); the log-authoritative contract is
+ * deliberate. The enumerated KNOWN DIVERGENCES live in issue-events-timeline.ts.
+ */
+export function issueEventsReadFromLogEnabled(): boolean {
+  return process.env.PAPERCLIP_ISSUE_EVENTS_READ_FROM_LOG === "true";
+}
+
+/**
  * Resolves an (agentId, userId) pair to the event's actor. Mirrors the
  * `actorAgentId ? "agent" : actorUserId ? "user" : "system"` idiom the issue
  * service already uses for logActivity, so the two logs attribute identically.

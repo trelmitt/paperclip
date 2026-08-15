@@ -8697,6 +8697,24 @@ export function issueService(db: Db) {
           .set({ updatedAt: new Date() })
           .where(eq(issues.id, comment.issueId));
 
+        if (issueEventsDualWriteEnabled()) {
+          // Retraction (backlog E6): the `commented` event stays in the append-only
+          // log, but work-timeline drops a deleted comment (isNull(deletedAt), or the
+          // row is gone). Emit `comment_removed` keyed on the SAME (issue_comments,
+          // comment.id) so the derived reader suppresses the matching `commented` and
+          // the read-flip stays byte-identical. No actor on this queue-cancel path -> system.
+          await appendIssueEvent(tx, {
+            companyId: comment.companyId,
+            issueId: comment.issueId,
+            kind: "comment_removed",
+            actorType: "system",
+            actorId: null,
+            sourceTable: "issue_comments",
+            sourceId: comment.id,
+            payload: { commentId: comment.id },
+          });
+        }
+
         return redactIssueComment(comment, currentUserRedactionOptions.enabled);
       });
     },
@@ -8741,6 +8759,28 @@ export function issueService(db: Db) {
           .update(issues)
           .set({ updatedAt: now })
           .where(eq(issues.id, comment.issueId));
+
+        if (issueEventsDualWriteEnabled()) {
+          // Retraction (backlog E6) — see removeComment. Same (issue_comments,
+          // comment.id) key so the derived reader drops this comment's `commented`,
+          // matching work-timeline's isNull(deletedAt) filter. The deleter is known
+          // here, so attribute it (vs system on the queue-cancel removeComment path).
+          const removedActor = resolveIssueEventActor(
+            actor.actorType === "agent" ? actor.agentId : null,
+            actor.actorType === "user" ? actor.userId : null,
+          );
+          await appendIssueEvent(tx, {
+            companyId: comment.companyId,
+            issueId: comment.issueId,
+            kind: "comment_removed",
+            actorType: removedActor.actorType,
+            actorId: removedActor.actorId,
+            actorRunId: actor.runId ?? null,
+            sourceTable: "issue_comments",
+            sourceId: comment.id,
+            payload: { commentId: comment.id },
+          });
+        }
 
         const redacted = redactIssueComment(comment, currentUserRedactionOptions.enabled);
         await options?.afterTombstone?.(redacted, tx);

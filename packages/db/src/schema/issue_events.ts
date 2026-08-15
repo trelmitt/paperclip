@@ -65,6 +65,7 @@ export const issueEvents = pgTable(
         'comment_removed',
         'approval_requested',
         'approval_resolved',
+        'approval_unlinked',
         'thread_interaction',
         'run_started',
         'run_finished'

@@ -11,6 +11,8 @@ import {
   issues,
   issueThreadInteractions,
 } from "@paperclipai/db";
+import { issueEventsReadFromLogEnabled } from "./issue-events.js";
+import { deriveWorkTimelineEventsFromLog } from "./issue-events-timeline.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 
 // DTO types are shared with the UI via @paperclipai/shared so both sides consume
@@ -489,15 +491,24 @@ export function workTimelineService(db: Db) {
     const events: WorkTimelineEvent[] = [];
     const edges: WorkTimelineEdge[] = [];
 
+    // Backlog E6: when the read-flip flag is on, the four log-derived event kinds
+    // (created/commented/approved/assigned) come from issue_events via
+    // deriveWorkTimelineEventsFromLog (appended after the loops) instead of the
+    // per-source derivation below. Structural events (`delegated`), all edges, and
+    // spans are never in the log and stay derived from the issue rows regardless.
+    const useLog = issueEventsReadFromLogEnabled();
+
     for (const issue of pagedIssues) {
       const creatorActorId = actorForIssueCreator(issue);
       actorIds.add(creatorActorId);
-      events.push({
-        actorId: creatorActorId,
-        kind: "created",
-        issueId: issue.id,
-        at: issue.createdAt.toISOString(),
-      });
+      if (!useLog) {
+        events.push({
+          actorId: creatorActorId,
+          kind: "created",
+          issueId: issue.id,
+          at: issue.createdAt.toISOString(),
+        });
+      }
 
       const assigneeActorId = actorForIssueAssignee(issue);
       if (assigneeActorId) {
@@ -688,7 +699,9 @@ export function workTimelineService(db: Db) {
           ? actorId("user", row.authorUserId)
           : actorId("system", "system");
       actorIds.add(commentActorId);
-      events.push({ actorId: commentActorId, kind: "commented", issueId: row.issueId, at: row.createdAt.toISOString() });
+      if (!useLog) {
+        events.push({ actorId: commentActorId, kind: "commented", issueId: row.issueId, at: row.createdAt.toISOString() });
+      }
     }
 
     for (const row of approvalRows) {
@@ -700,12 +713,14 @@ export function workTimelineService(db: Db) {
             ? actorId("user", row.requestedByUserId)
             : actorId("system", "system");
       actorIds.add(approvalActorId);
-      events.push({
-        actorId: approvalActorId,
-        kind: "approved",
-        issueId: row.issueId,
-        at: (row.decidedAt ?? row.createdAt).toISOString(),
-      });
+      if (!useLog) {
+        events.push({
+          actorId: approvalActorId,
+          kind: "approved",
+          issueId: row.issueId,
+          at: (row.decidedAt ?? row.createdAt).toISOString(),
+        });
+      }
     }
 
     for (const row of interactionRows) {
@@ -719,12 +734,14 @@ export function workTimelineService(db: Db) {
               ? actorId("user", row.createdByUserId)
               : actorId("system", "system");
       actorIds.add(interactionActorId);
-      events.push({
-        actorId: interactionActorId,
-        kind: "approved",
-        issueId: row.issueId,
-        at: (row.resolvedAt ?? row.createdAt).toISOString(),
-      });
+      if (!useLog) {
+        events.push({
+          actorId: interactionActorId,
+          kind: "approved",
+          issueId: row.issueId,
+          at: (row.resolvedAt ?? row.createdAt).toISOString(),
+        });
+      }
     }
 
     for (const row of logRows) {
@@ -734,7 +751,9 @@ export function workTimelineService(db: Db) {
       const fromActorId = actorId(logActorType, row.actorId);
       actorIds.add(fromActorId);
       if (row.action.includes("assign")) {
-        events.push({ actorId: fromActorId, kind: "assigned", issueId: row.issueId, at: row.createdAt.toISOString() });
+        if (!useLog) {
+          events.push({ actorId: fromActorId, kind: "assigned", issueId: row.issueId, at: row.createdAt.toISOString() });
+        }
         const details = row.details && typeof row.details === "object" && !Array.isArray(row.details)
           ? row.details as Record<string, unknown>
           : {};
@@ -755,6 +774,20 @@ export function workTimelineService(db: Db) {
             kind: "assignment",
           });
         }
+      }
+    }
+
+    // E6 read-flip: the four log-derived kinds come from issue_events instead of the
+    // per-source loops above (which skipped their pushes under useLog). The derived
+    // reader reproduces work-timeline's actorId encoding + windowing exactly (proven
+    // by the timeline-parity test), so flag-on and flag-off `events` match. Actor ids
+    // are already collected from the source rows above; add the derived ones too in
+    // case a backfilled event outlives its source row.
+    if (useLog) {
+      const logEvents = await deriveWorkTimelineEventsFromLog(db, { issueIds: readableIssueIds, from, to });
+      for (const event of logEvents) {
+        actorIds.add(event.actorId);
+        events.push(event);
       }
     }
 

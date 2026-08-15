@@ -23,13 +23,38 @@ import type { WorkTimelineEvent } from "@paperclipai/shared";
  *     present, else the creation stands (creator @createdAt).
  *
  * The reader now covers all four of work-timeline's derived event kinds.
+ *
+ * Retractions & the log-authoritative contract (E6 review). The log is append-only: a
+ * `commented`/`approved` it emitted once is never rewritten. Genuine deletions ARE matched
+ * — deletion sites emit `comment_removed` / `approval_unlinked` on the SAME source key and
+ * this reader suppresses the matching event. But work-timeline re-derives from MUTABLE
+ * rows, so any later mutation of a re-derived field diverges from the frozen log. Per the
+ * review the contract is LOG-AUTHORITATIVE (see issue-events.ts): the log is the faithful
+ * point-in-time record; the mutable view is the lossy one. Chasing byte-identity across
+ * every mutation site is an unbounded treadmill, so it is deliberately not the goal.
+ *
+ * KNOWN DIVERGENCES (log is the more-faithful record, except #4 = append-only ceiling):
+ *   1. createdAt backdating — productivity-review backdates issues/issue_comments.createdAt
+ *      AFTER insert; the log keeps the real insert time, so `created`/`commented` `at` differ.
+ *   2. Parked revision-request — approvals.requestRevision sets decidedAt with no terminal
+ *      decision; work-timeline (no status filter) mislabels it `approved`@reviewer while the
+ *      log shows the pending request. Terminal decisions (approve/reject/cancel, resubmit-
+ *      then-decide) DO match. Recording the revision itself is F/H-completeness (no revision
+ *      timeline-kind here) — deferred.
+ *   3. Agent hard-deletion nulls issues.createdByAgentId/assigneeAgentId, re-attributing the
+ *      derived `created`/`assigned` actor; the log keeps the original actor.
+ *   4. unlink -> re-link the same (issue,approval): the log records the unlink; the re-link
+ *      is idempotency-swallowed, so the reader keeps suppressing an approval the mutable view
+ *      shows again. Append-only ceiling (see issue-approvals.ts).
  */
 
 const KINDS = [
   "created",
   "commented",
+  "comment_removed",
   "approval_requested",
   "approval_resolved",
+  "approval_unlinked",
   "assignee_changed",
   "thread_interaction",
 ] as const;
@@ -68,6 +93,21 @@ export async function deriveWorkTimelineEventsFromLog(
     .where(and(inArray(issueEvents.issueId, input.issueIds), inArray(issueEvents.kind, KINDS as unknown as string[])))
     .orderBy(asc(issueEvents.id));
 
+  // Pre-pass — collect retraction keys (backlog E6). A retraction (`comment_removed`
+  // / `approval_unlinked`) is appended AFTER the event it cancels, so it can sort later
+  // than its target in this id-ordered scan; gather them up front, then suppress in the
+  // main pass so the derived reader matches work-timeline, which drops a deleted comment
+  // (isNull(deletedAt)) and an unlinked approval (inner-join on issue_approvals).
+  const removedComments = new Set<string>();
+  const unlinkedApprovals = new Set<string>();
+  for (const row of rows) {
+    if (row.kind === "comment_removed") {
+      if (row.sourceId) removedComments.add(row.sourceId);
+    } else if (row.kind === "approval_unlinked") {
+      if (row.sourceId) unlinkedApprovals.add(row.sourceId);
+    }
+  }
+
   const events: WorkTimelineEvent[] = [];
   // Collapse approval_requested + approval_resolved for the same (issue,approval)
   // link into one `approved`, mirroring work-timeline: the resolved event wins
@@ -91,6 +131,7 @@ export async function deriveWorkTimelineEventsFromLog(
         at: row.createdAt.toISOString(),
       });
     } else if (row.kind === "commented") {
+      if (row.sourceId && removedComments.has(row.sourceId)) continue; // retracted (deleted comment)
       if (!inWindow(row.createdAt, input.from, input.to)) continue;
       events.push({
         actorId: encodeActor(row.actorType, row.actorId),
@@ -128,7 +169,8 @@ export async function deriveWorkTimelineEventsFromLog(
     }
   }
 
-  for (const pair of approvalPair.values()) {
+  for (const [key, pair] of approvalPair) {
+    if (unlinkedApprovals.has(key)) continue; // retracted (unlinked approval)
     const chosen = pair.resolved ?? pair.requested;
     if (!chosen) continue;
     // work-timeline includes the link if the request OR the decision falls in the

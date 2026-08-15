@@ -181,10 +181,40 @@ export function issueApprovalService(db: Db) {
     },
 
     unlink: async (issueId: string, approvalId: string) => {
-      await assertIssueAndApprovalSameCompany(issueId, approvalId);
-      await db
+      const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
+      const [removed] = await db
         .delete(issueApprovals)
-        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.approvalId, approvalId)));
+        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.approvalId, approvalId)))
+        .returning();
+
+      // Retraction (backlog E6): the approval_requested/_resolved events stay in the
+      // append-only log, but work-timeline drops the `approved` once the junction row
+      // is gone (it inner-joins issue_approvals). Emit `approval_unlinked` on the SAME
+      // (issue_approvals, `${issueId}:${approvalId}`) key so the derived reader
+      // suppresses the collapsed `approved` and the read-flip stays byte-identical.
+      // Only when a link was actually removed — nothing to retract otherwise.
+      //
+      // ponytail: append-only ceiling — unlink, then re-link the SAME (issue,approval)
+      // leaves this `approval_unlinked` in the log while the re-link's approval_requested
+      // is idempotency-skipped (partial unique index on source_table/source_id/kind), so
+      // the log-read keeps suppressing an approval the mutable view now shows again. This
+      // IS reachable (POST /issues/:id/approvals re-links after a DELETE unlink) — a
+      // proper fix needs an `approval_relinked` kind + reader recency, disproportionate
+      // for a rare manual sequence. Same class as the interaction-reopen residual in
+      // appendInteractionRowEvents; a documented log-authoritative divergence (see
+      // issue-events-timeline.ts KNOWN DIVERGENCES), not chased to byte-identity.
+      if (removed && issueEventsDualWriteEnabled()) {
+        await appendIssueEvent(db, {
+          companyId: issue.companyId,
+          issueId,
+          kind: "approval_unlinked",
+          actorType: "system",
+          actorId: null,
+          sourceTable: "issue_approvals",
+          sourceId: `${issueId}:${approvalId}`,
+          payload: { approvalId },
+        });
+      }
     },
 
     linkManyForApproval: async (approvalId: string, issueIds: string[], actor?: LinkActor) => {
