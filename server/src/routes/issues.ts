@@ -43,6 +43,7 @@ import {
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
+  forkIssueSchema,
   createIssueSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
@@ -8172,6 +8173,28 @@ export function issueRoutes(
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });
+  });
+
+  // J (fork / side-chat): branch a hidden scratch child from a parent at an
+  // event-log anchor. No assignee, no workspace, backlog+hidden — so the heavy
+  // assignment/attribution/adapter guards on /children do not apply; only the
+  // access + write-influence + low-trust floors do.
+  router.post("/issues/:id/forks", validate(forkIssueSchema), async (req, res) => {
+    const parentId = req.params.id as string;
+    const parent = await getAccessibleResource(req, res, svc.getById(parentId), "Parent issue not found");
+    if (!parent) return;
+    if (!isTaskBridgeKeyActor(req) && !(await assertIssueWriteInfluenceAllowed(req, res, parent))) return;
+    if (!(await assertTaskWatchdogCreateIssueAllowed(req, res, parent.companyId, parent))) return;
+    if (await assertLowTrustControlPlaneDenied(req, res, parent.companyId, parent)) return;
+    const actor = getActorInfo(req);
+    const { issue } = await svc.forkIssue(parent.id, {
+      title: req.body.title ?? null,
+      anchorEventId: req.body.anchorEventId ?? null,
+      createdByAgentId: actor.agentId,
+      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      actorRunId: actor.runId,
+    });
+    res.status(201).json(issue);
   });
 
   router.post("/issues/:id/children", applyCreateIssueStatusDefault, validate(createChildIssueSchema), async (req, res) => {

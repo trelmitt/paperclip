@@ -537,6 +537,16 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBa
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 
+// J (fork / side-chat): branch a hidden scratch child from a parent, optionally
+// seeded with the parent's conversation up to a chosen issue_events anchor.
+export const forkIssueSchema = z.object({
+  title: z.string().trim().min(1).max(500).optional().nullable(),
+  // A global issue_events.id (bigserial). Omit to seed the whole comment prefix.
+  anchorEventId: z.coerce.number().int().positive().optional().nullable(),
+}).strict();
+
+export type ForkIssue = z.infer<typeof forkIssueSchema>;
+
 export const createAcceptedPlanDecompositionSchema = z.object({
   acceptedPlanRevisionId: z.string().uuid(),
   children: z.array(createChildIssueSchema).min(1).max(25),

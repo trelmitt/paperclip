@@ -20,6 +20,7 @@ import {
   respondIssueThreadInteractionSchema,
   resolveIssueRecoveryActionSchema,
   restoreIssueDocumentRevisionSchema,
+  forkIssueSchema,
   updateIssueSchema,
   updateIssueWorkProductSchema,
   type Issue,
@@ -554,6 +555,28 @@ export function registerIssueCommands(program: Command): void {
           const payload = createChildIssueSchema.parse(parseJson(opts.payloadJson));
           const child = await ctx.api.post<Issue>(apiPath`/api/issues/${issueId}/children`, payload);
           printOutput(child, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("fork")
+      .description("Create a hidden scratch fork branching from a parent issue's event-log anchor")
+      .argument("<issueId>", "Parent issue ID")
+      .option("--title <title>", "Fork title")
+      .option("--anchor-event-id <id>", "issue_events.id to branch at (default: latest)")
+      .action(async (issueId: string, opts: BaseClientOptions & { title?: string; anchorEventId?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = forkIssueSchema.parse({
+            title: opts.title,
+            anchorEventId: parseOptionalInt(opts.anchorEventId),
+          });
+          const fork = await ctx.api.post<Issue>(apiPath`/api/issues/${issueId}/forks`, payload);
+          printOutput(fork, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
