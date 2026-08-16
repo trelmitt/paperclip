@@ -311,6 +311,35 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
   });
 
+  it("re-runs the adapter-override gate on the plugin-host path (no route bypass) for create and update", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    // create: a plugin cannot pin an issue onto an adapter this instance does not know.
+    await expect(
+      services.issues.create({
+        companyId,
+        title: "Route onto a bogus runner via the SDK",
+        assigneeAgentId: agentId,
+        assigneeAdapterOverrides: { adapterType: "totally_not_an_adapter" },
+      } as any),
+    ).rejects.toThrow("Unknown adapter type: totally_not_an_adapter");
+
+    // update: same gate on the update path (which will back the new SDK update() field).
+    const issue = await services.issues.create({
+      companyId,
+      title: "Legit issue",
+      assigneeAgentId: agentId,
+    });
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId,
+        patch: { assigneeAdapterOverrides: { adapterType: "totally_not_an_adapter" } } as any,
+      }),
+    ).rejects.toThrow("Unknown adapter type: totally_not_an_adapter");
+  });
+
   it("creates plugin operation issues with the generic operation origin", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());

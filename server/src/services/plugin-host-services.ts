@@ -34,6 +34,7 @@ import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { issueService } from "./issues.js";
+import { assertIssueAssigneeAdapterOverrideAllowed } from "./issue-assignee-adapter-override-gate.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -1901,6 +1902,19 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        // G: the plugin-host reaches issueService directly, bypassing the Express route's
+        // adapter-override gate — so re-run the same write-time authority check here, or a
+        // plugin could pin an issue onto an unknown/disabled adapter or escalate a built-in
+        // past its allowlist.
+        await assertIssueAssigneeAdapterOverrideAllowed(
+          db,
+          companyId,
+          {
+            assigneeAdapterOverrides: (params as { assigneeAdapterOverrides?: unknown }).assigneeAdapterOverrides,
+            assigneeAgentId: (params as { assigneeAgentId?: unknown }).assigneeAgentId,
+          },
+          null,
+        );
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
@@ -1948,6 +1962,31 @@ export function buildHostServices(
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
+        // G: mirror the route's reassignment auto-strip + adapter-override gate on the
+        // plugin-host path (which bypasses routes/issues.ts). Strip a stale adapter pin when
+        // reassigning to a different agent without re-supplying overrides, then validate any
+        // remaining/explicit override against the effective assignee — so a plugin cannot
+        // pin an unknown/disabled adapter, escalate a built-in, or inherit a disallowed pin.
+        const reassignsToDifferentAgent =
+          typeof patch.assigneeAgentId === "string" && patch.assigneeAgentId !== existing.assigneeAgentId;
+        const patchProvidesAdapterOverrides = Object.prototype.hasOwnProperty.call(patch, "assigneeAdapterOverrides");
+        const persistedAdapterOverrides =
+          (existing as { assigneeAdapterOverrides?: Record<string, unknown> | null }).assigneeAdapterOverrides ?? null;
+        if (
+          reassignsToDifferentAgent &&
+          !patchProvidesAdapterOverrides &&
+          persistedAdapterOverrides &&
+          typeof persistedAdapterOverrides.adapterType === "string"
+        ) {
+          const { adapterType: _strippedAdapterType, ...retainedOverride } = persistedAdapterOverrides;
+          patch.assigneeAdapterOverrides = Object.keys(retainedOverride).length > 0 ? retainedOverride : null;
+        }
+        await assertIssueAssigneeAdapterOverrideAllowed(
+          db,
+          companyId,
+          { assigneeAdapterOverrides: patch.assigneeAdapterOverrides, assigneeAgentId: patch.assigneeAgentId },
+          existing.assigneeAgentId ?? null,
+        );
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
           actorAgentId,
