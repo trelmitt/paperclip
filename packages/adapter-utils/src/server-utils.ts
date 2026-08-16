@@ -2411,6 +2411,19 @@ export async function resolveCommandForLogs(
   return (await resolveCommandPath(command, cwd, env)) ?? command;
 }
 
+/**
+ * True when `command` resolves on the host's PATH (or as an absolute/relative
+ * path). Detection only — scans PATH and checks existence, and NEVER executes
+ * the command. Used to report which adapter runtimes are installed.
+ */
+export async function isCommandInstalled(
+  command: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<boolean> {
+  return (await resolveCommandPath(command, cwd, env)) !== null;
+}
+
 function quoteForCmd(arg: string) {
   if (!arg.length) return '""';
   const escaped = arg.replace(/"/g, '""');

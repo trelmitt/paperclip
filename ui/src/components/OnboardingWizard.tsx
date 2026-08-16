@@ -10,6 +10,7 @@ import { agentsApi } from "../api/agents";
 import { approvalsApi } from "../api/approvals";
 import { issuesApi } from "../api/issues";
 import { projectsApi } from "../api/projects";
+import { adaptersApi } from "../api/adapters";
 import { queryKeys } from "../lib/queryKeys";
 import { Dialog, DialogPortal } from "@/components/ui/dialog";
 import {
@@ -319,6 +320,18 @@ function OnboardingWizardInner({
   // expected to reject signed-out browsers.
   const disabledTypes = useDisabledAdaptersSync({ enabled: effectiveOnboardingOpen });
   const adapterRegistryLoaded = useAdapterRegistryLoaded({ enabled: effectiveOnboardingOpen });
+  // M: probe which adapter runtimes are actually installed on the host, so the
+  // grid can surface installed ones instead of offering every adapter equally.
+  const { data: installedAdapters } = useQuery({
+    queryKey: ["adapters", "detect-installed"],
+    queryFn: () => adaptersApi.detectInstalled(),
+    enabled: effectiveOnboardingOpen,
+    staleTime: 60_000,
+  });
+  const installedAdapterTypes = useMemo(
+    () => new Set((installedAdapters ?? []).filter((a) => a.installed).map((a) => a.type)),
+    [installedAdapters],
+  );
 
   const initialStep = effectiveOnboardingOptions.initialStep ?? 0;
   const existingCompanyId = effectiveOnboardingOptions.companyId;
@@ -579,13 +592,17 @@ function OnboardingWizardInner({
         !disabledTypes.has(a.type) &&
         isVisualAdapterChoice(a.type)
       )
-      .map((a) => ({ ...getAdapterDisplay(a.type), type: a.type }));
+      .map((a) => ({ ...getAdapterDisplay(a.type), type: a.type, installed: installedAdapterTypes.has(a.type) }));
 
+    // Float installed runtimes to the top of each group (stable otherwise), so an
+    // operator sees what they can actually run first.
+    const installedFirst = (a: { installed: boolean }, b: { installed: boolean }) =>
+      Number(b.installed) - Number(a.installed);
     return {
-      recommendedAdapters: all.filter((a) => a.recommended),
-      moreAdapters: all.filter((a) => !a.recommended),
+      recommendedAdapters: all.filter((a) => a.recommended).sort(installedFirst),
+      moreAdapters: all.filter((a) => !a.recommended).sort(installedFirst),
     };
-  }, [disabledTypes]);
+  }, [disabledTypes, installedAdapterTypes]);
 
   // The default (or a saved) adapterType can name an adapter the server has
   // since disabled — e.g. a cloud sandbox registry without claude_local. The
@@ -1714,6 +1731,11 @@ function OnboardingWizardInner({
                               Recommended
                             </Badge>
                           )}
+                          {opt.installed && (
+                            <Badge variant="ghost" className="absolute -top-1.5 left-1.5 bg-sky-500 text-white text-(length:--text-nano) font-semibold px-1.5 leading-none">
+                              Installed
+                            </Badge>
+                          )}
                           <opt.icon className="h-4 w-4" />
                           <span className="font-medium">{opt.label}</span>
                           <span className="text-muted-foreground text-(length:--text-nano)">
@@ -1769,6 +1791,11 @@ function OnboardingWizardInner({
                               setModel("");
                             }}
                           >
+                            {opt.installed && !opt.comingSoon && (
+                              <Badge variant="ghost" className="absolute -top-1.5 left-1.5 bg-sky-500 text-white text-(length:--text-nano) font-semibold px-1.5 leading-none">
+                                Installed
+                              </Badge>
+                            )}
                             <opt.icon className="h-4 w-4" />
                             <span className="font-medium">{opt.label}</span>
                             <span className="text-muted-foreground text-(length:--text-nano)">

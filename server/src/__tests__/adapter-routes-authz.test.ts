@@ -341,6 +341,52 @@ describe.sequential("adapter management route authorization", () => {
     },
   );
 
+  it("reports adapter runtime install state to board members without executing anything", async () => {
+    resetInstalledExternalAdapterState();
+    const NEVER = "paperclip-nonexistent-cli-xyz-please-never-exist";
+    unregisterServerAdapter("detect_present_test");
+    unregisterServerAdapter("detect_absent_test");
+    registerServerAdapter({
+      ...createAdapter("detect_present_test"),
+      getRuntimeCommandSpec: () => ({ command: "sh", detectCommand: "sh", installCommand: null }),
+    });
+    registerServerAdapter({
+      ...createAdapter("detect_absent_test"),
+      getRuntimeCommandSpec: () => ({ command: NEVER, detectCommand: NEVER, installCommand: null }),
+    });
+
+    try {
+      // A plain board member (viewer) — not an instance admin — may read this.
+      const app = createApp(boardMember("viewer"));
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get("/api/adapters/detect-installed"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const byType = new Map<string, any>(res.body.map((r: any) => [r.type, r]));
+      // `sh` resolves on any POSIX test host PATH; the sentinel never does.
+      expect(byType.get("detect_present_test")).toMatchObject({ detectCommand: "sh", installed: true });
+      expect(byType.get("detect_absent_test")).toMatchObject({ detectCommand: NEVER, installed: false });
+      // Detection is a PATH scan only — it must never spawn a process.
+      expect(mocks.execFile).not.toHaveBeenCalled();
+    } finally {
+      unregisterServerAdapter("detect_present_test");
+      unregisterServerAdapter("detect_absent_test");
+    }
+  });
+
+  it("rejects adapter install-state probe for non-board actors", async () => {
+    const app = createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+    } as unknown as Express.Request["actor"]);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/adapters/detect-installed"),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+  });
+
   describe("cloud-managed adapter code install floor", () => {
     beforeEach(() => {
       process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "test-server-token";

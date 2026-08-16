@@ -36,6 +36,7 @@ export const ensurePathInEnv = serverUtils.ensurePathInEnv;
 export const ensureAbsoluteDirectory = serverUtils.ensureAbsoluteDirectory;
 export const ensureCommandResolvable = serverUtils.ensureCommandResolvable;
 export const resolveCommandForLogs = serverUtils.resolveCommandForLogs;
+export const isCommandInstalled = serverUtils.isCommandInstalled;
 
 export function buildInvocationEnvForLogs(
   env: Record<string, string>,

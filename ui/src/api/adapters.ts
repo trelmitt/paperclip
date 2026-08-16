@@ -50,9 +50,20 @@ export interface AdapterInstallResult {
   installedAt: string;
 }
 
+export interface AdapterInstalledInfo {
+  type: string;
+  /** The runtime CLI the adapter looks for on PATH, or null if it has none. */
+  detectCommand: string | null;
+  /** Whether that CLI resolves on the server host's PATH; null when unknown. */
+  installed: boolean | null;
+}
+
 export const adaptersApi = {
   /** List all registered adapters (built-in + external). */
   list: () => api.get<AdapterInfo[]>("/adapters"),
+
+  /** Report which enabled adapters have their runtime CLI on the server host's PATH. */
+  detectInstalled: () => api.get<AdapterInstalledInfo[]>("/adapters/detect-installed"),
 
   /** Install an external adapter from npm or a local path. */
   install: (params: { packageName: string; version?: string; isLocalPath?: boolean }) =>

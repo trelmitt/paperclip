@@ -41,6 +41,7 @@ import {
 } from "../services/adapter-plugin-store.js";
 import type { AdapterPluginRecord } from "../services/adapter-plugin-store.js";
 import type { ServerAdapterModule, AdapterConfigSchema } from "../adapters/types.js";
+import { isCommandInstalled } from "../adapters/utils.js";
 import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden } from "../errors.js";
@@ -234,6 +235,45 @@ export function adapterRoutes() {
     const result: AdapterInfo[] = registeredAdapters.map((adapter) =>
       buildAdapterInfo(adapter, externalRecords.get(adapter.type), disabledSet),
     ).sort((a, b) => a.type.localeCompare(b.type));
+
+    res.json(result);
+  });
+
+  /**
+   * GET /api/adapters/detect-installed
+   *
+   * Report which enabled adapters have their runtime CLI available on the
+   * server host's PATH. Read-only host probe — `isCommandInstalled` scans PATH
+   * and checks existence, it NEVER executes the command, and the detect command
+   * comes from the adapter registry (not from the request), so there is no
+   * user-controlled execution surface. Onboarding uses this to surface which
+   * runtimes are actually installed instead of offering every adapter as an
+   * equal peer. `installed` is null when an adapter exposes no local detect
+   * command (e.g. remote/gateway adapters).
+   */
+  router.get("/adapters/detect-installed", async (req, res) => {
+    // Same gate as GET /adapters: ordinary board members configuring agents.
+    assertBoardOrgAccess(req);
+
+    const cwd = process.cwd();
+    const env = process.env;
+    const result = await Promise.all(
+      listEnabledServerAdapters().map(async (adapter) => {
+        let detectCommand: string | null = null;
+        try {
+          detectCommand = adapter.getRuntimeCommandSpec?.({})?.detectCommand ?? null;
+        } catch {
+          // An adapter whose spec builder throws on empty config is simply
+          // reported as "unknown" rather than failing the whole probe.
+          detectCommand = null;
+        }
+        const installed = detectCommand
+          ? await isCommandInstalled(detectCommand, cwd, env)
+          : null;
+        return { type: adapter.type, detectCommand, installed };
+      }),
+    );
+    result.sort((a, b) => a.type.localeCompare(b.type));
 
     res.json(result);
   });
