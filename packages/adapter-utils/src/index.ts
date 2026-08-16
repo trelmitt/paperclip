@@ -95,3 +95,5 @@ export type {
   SandboxCallbackBridgeWorkerHandle,
   StartedSandboxCallbackBridgeServer,
 } from "./sandbox-callback-bridge.js";
+export type { SafetyGuardDeclaration } from "./execution-target.js";
+export { checkShellCommandSafety } from "./execution-target.js";

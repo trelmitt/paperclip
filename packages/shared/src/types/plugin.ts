@@ -28,6 +28,7 @@ import type {
   RoutineStatus,
   IssueSurfaceVisibility,
 } from "../constants.js";
+import type { SafetyGuardDeclaration } from "@paperclipai/adapter-utils";
 import type { Agent } from "./agent.js";
 import type { CompanySkill } from "./company-skill.js";
 import type { Project } from "./project.js";
@@ -630,8 +631,10 @@ export interface PaperclipPluginManifestV1 {
   skills?: PluginManagedSkillDeclaration[];
   /** Trusted local folders this plugin can configure and access by stable key. */
   localFolders?: PluginLocalFolderDeclaration[];
-  /** External object reference providers this plugin contributes. */
+   /** External object reference providers this plugin contributes. */
   objectReferences?: PluginObjectReferenceProviderDeclaration[];
+   /** Workspace safety guards configuration. Requires `workspace.safety` capability. */
+  workspaceSafetyGuards?: { guards: SafetyGuardDeclaration[] };
   /**
    * Legacy top-level launcher declarations.
    * Prefer `ui.launchers` for new manifests.

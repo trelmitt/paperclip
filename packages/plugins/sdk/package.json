@@ -108,6 +108,7 @@
     "dev:server": "tsx src/dev-cli.ts"
   },
   "dependencies": {
+    "@paperclipai/adapter-utils": "workspace:*",
     "@paperclipai/shared": "workspace:*",
     "zod": "^3.24.2"
   },

@@ -28,7 +28,7 @@ import { effectiveCostCentsSum } from "./cost-imputation-sql.js";
 
 // Metrics whose policies are enforced. effective_cents lets subscription
 // (imputed) token usage trip the same soft/hard gates as real billed spend.
-const ENFORCED_BUDGET_METRICS = ["billed_cents", "effective_cents"] as const;
+const ENFORCED_BUDGET_METRICS = ["billed_cents", "effective_cents", "tokens"] as const;
 
 type ScopeRecord = {
   companyId: string;
@@ -149,7 +149,7 @@ async function computeObservedAmount(
   db: Db,
   policy: Pick<PolicyRow, "companyId" | "scopeType" | "scopeId" | "windowKind" | "metric">,
 ) {
-  if (policy.metric !== "billed_cents" && policy.metric !== "effective_cents") return 0;
+  if (policy.metric !== "billed_cents" && policy.metric !== "effective_cents" && policy.metric !== "tokens") return 0;
 
   const conditions = [eq(costEvents.companyId, policy.companyId)];
   if (policy.scopeType === "agent") conditions.push(eq(costEvents.agentId, policy.scopeId));
@@ -165,6 +165,8 @@ async function computeObservedAmount(
   const totalExpr =
     policy.metric === "effective_cents"
       ? effectiveCostCentsSum()
+      : policy.metric === "tokens"
+      ? sql<number>`coalesce(sum(${costEvents.inputTokens} + ${costEvents.outputTokens}), 0)::double precision`
       : sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`;
 
   const [row] = await db

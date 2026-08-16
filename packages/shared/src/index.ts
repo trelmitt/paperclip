@@ -2381,3 +2381,6 @@ export {
   type FeatureTier,
   type InstanceFeatureKey,
 } from "./feature-catalog.js";
+
+export type { SafetyGuardDeclaration } from "@paperclipai/adapter-utils";
+export { checkShellCommandSafety } from "@paperclipai/adapter-utils";

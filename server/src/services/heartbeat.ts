@@ -27,6 +27,7 @@ import {
   type RunLivenessState,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
+import { effectiveCostCents } from "@paperclipai/shared";
 import {
   agents,
   agentConfigRevisions,
@@ -3687,10 +3688,19 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
   return readNonEmptyString(result.biller) ?? readNonEmptyString(result.provider) ?? "unknown";
 }
 
-function normalizeBilledCostCents(costUsd: number | null | undefined, billingType: BillingType): number {
-  if (billingType === "subscription_included") return 0;
-  if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
-  return Math.max(0, Math.round(costUsd * 100));
+function normalizeBilledCostCents(costUsd: number | null | undefined, billingType: BillingType, usage?: { model?: string | null; inputTokens?: number | null; cachedInputTokens?: number | null; outputTokens?: number | null }): number {
+  if (typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd >= 0) {
+    return Math.max(0, Math.round(costUsd * 100));
+  }
+  if (usage) {
+    return effectiveCostCents({
+      model: usage.model,
+      inputTokens: usage.inputTokens ?? 0,
+      cachedInputTokens: usage.cachedInputTokens ?? 0,
+      outputTokens: usage.outputTokens ?? 0,
+    });
+  }
+  return 0;
 }
 
 export function resolveLedgerCostStatus(input: {
@@ -13389,7 +13399,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
     const billedCostUsd = resolveCacheAdjustedCostUsd(result);
-    const additionalCostCents = normalizeBilledCostCents(billedCostUsd, billingType);
+    const additionalCostCents = normalizeBilledCostCents(billedCostUsd, billingType, {
+      model: result.model ?? "unknown",
+      inputTokens,
+      cachedInputTokens,
+      outputTokens,
+    });
     const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
       costUsd: billedCostUsd,
