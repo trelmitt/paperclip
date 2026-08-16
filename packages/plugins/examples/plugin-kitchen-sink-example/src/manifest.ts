@@ -269,6 +269,13 @@ const manifest: PaperclipPluginManifestV1 = {
         entityTypes: ["comment"],
       },
       {
+        type: "commentAnnotation",
+        id: SLOT_IDS.directiveCard,
+        displayName: "Kitchen Sink Directive Card",
+        exportName: EXPORT_NAMES.directiveCard,
+        entityTypes: ["comment"],
+      },
+      {
         type: "commentContextMenuItem",
         id: SLOT_IDS.commentContextMenuItem,
         displayName: "Kitchen Sink Comment Action",

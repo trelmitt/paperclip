@@ -111,6 +111,7 @@ type PluginConfigData = {
   showSidebarPanel?: boolean;
   showProjectSidebarItem?: boolean;
   showCommentAnnotation?: boolean;
+  showDirectiveCard?: boolean;
   showCommentContextMenuItem?: boolean;
   enableWorkspaceDemos?: boolean;
   enableProcessDemos?: boolean;
@@ -2186,6 +2187,14 @@ export function KitchenSinkSettingsPage({ context }: PluginSettingsPageProps) {
         <label style={rowStyle}>
           <input
             type="checkbox"
+            checked={configJson.showDirectiveCard !== false}
+            onChange={(event) => setField("showDirectiveCard", event.target.checked)}
+          />
+          <span>Show directive card</span>
+        </label>
+        <label style={rowStyle}>
+          <input
+            type="checkbox"
             checked={configJson.showCommentContextMenuItem !== false}
             onChange={(event) => setField("showCommentContextMenuItem", event.target.checked)}
           />
@@ -2437,6 +2446,56 @@ export function KitchenSinkCommentAnnotation({ context }: PluginCommentAnnotatio
       <div>Comment length: {data.data.length}</div>
       <div>Copied count: {data.data.copiedCount}</div>
       <div style={{ opacity: 0.75 }}>{data.data.preview}</div>
+    </div>
+  );
+}
+
+// N (inline directive cards): pull actionable directives out of a comment body.
+// A directive is a slash command (`/deploy`), a bang (`!urgent`), or a
+// convention marker (`TODO:` / `FIXME:` / `ACTION:`). Untrusted comment text —
+// only ever rendered as labelled data, never executed.
+const DIRECTIVE_PATTERN = /(?:^|\s)(?:([/!]\w[\w-]*)|(TODO|FIXME|ACTION|NOTE):)/gi;
+
+function parseDirectives(text: string): string[] {
+  const found = new Set<string>();
+  for (const match of text.matchAll(DIRECTIVE_PATTERN)) {
+    found.add((match[1] ?? `${match[2]}:`).toLowerCase());
+  }
+  return [...found];
+}
+
+export function KitchenSinkDirectiveCard({ context }: PluginCommentAnnotationProps) {
+  const config = usePluginConfigData();
+  const data = usePluginData<CommentContextData>(
+    "comment-context",
+    context.companyId
+      ? { companyId: context.companyId, issueId: context.parentEntityId, commentId: context.entityId }
+      : {},
+  );
+  if (config.data && config.data.showDirectiveCard === false) return null;
+  if (!data.data) return null;
+  const directives = parseDirectives(data.data.preview);
+  // Only surface the card when the comment actually carries a directive — that
+  // contextual show/hide is the whole point of a directive card.
+  if (directives.length === 0) return null;
+  return (
+    <div style={{ ...subtleCardStyle, borderColor: "var(--border)", fontSize: "11px" }}>
+      <strong>Directives detected</strong>
+      <div style={{ ...rowStyle, marginTop: "6px" }}>
+        {directives.map((directive) => (
+          <span
+            key={directive}
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: "999px",
+              padding: "2px 8px",
+              fontFamily: "monospace",
+            }}
+          >
+            {directive}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }

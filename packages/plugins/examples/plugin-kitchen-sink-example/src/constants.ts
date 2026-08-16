@@ -18,6 +18,7 @@ export const SLOT_IDS = {
   toolbarButton: "kitchen-sink-toolbar-action",
   contextMenuItem: "kitchen-sink-context-action",
   commentAnnotation: "kitchen-sink-comment-annotation",
+  directiveCard: "kitchen-sink-directive-card",
   commentContextMenuItem: "kitchen-sink-comment-action",
 } as const;
 
@@ -35,6 +36,7 @@ export const EXPORT_NAMES = {
   toolbarButton: "KitchenSinkToolbarButton",
   contextMenuItem: "KitchenSinkContextMenuItem",
   commentAnnotation: "KitchenSinkCommentAnnotation",
+  directiveCard: "KitchenSinkDirectiveCard",
   commentContextMenuItem: "KitchenSinkCommentContextMenuItem",
   launcherModal: "KitchenSinkLauncherModal",
 } as const;
@@ -89,6 +91,7 @@ export const DEFAULT_CONFIG = {
   showSidebarPanel: true,
   showProjectSidebarItem: true,
   showCommentAnnotation: true,
+  showDirectiveCard: true,
   showCommentContextMenuItem: true,
   enableWorkspaceDemos: true,
   enableProcessDemos: false,
