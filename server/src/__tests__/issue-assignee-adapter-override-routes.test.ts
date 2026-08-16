@@ -3,13 +3,14 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { activityLog, agents, agentTaskSessions, companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
+import { activityLog, agents, agentRuntimeState, agentTaskSessions, companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { listServerAdapters } from "../adapters/registry.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
@@ -77,6 +78,7 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(agentTaskSessions);
+    await db.delete(agentRuntimeState);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
@@ -426,6 +428,44 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
       // Every session for the swapped issue is gone (across adapters)...
       expect(rows.filter((r) => r.taskKey === issueId)).toHaveLength(0);
       // ...but the unrelated task session is untouched (blast radius scoped).
+      expect(rows.filter((r) => r.taskKey === otherTaskKey)).toHaveLength(1);
+    },
+  );
+
+  it.skipIf(!SWAP_FROM_ADAPTER || !SWAP_TO_ADAPTER)(
+    "Phase 4: operator reset clears an override issue's session even though it lives under the override adapter, not agent.adapterType",
+    async () => {
+      const agentAdapter = SWAP_FROM_ADAPTER!; // the agent's own default
+      const overrideAdapter = SWAP_TO_ADAPTER!; // where the pinned issue session lives
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const otherTaskKey = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      await db.insert(agents).values({
+        id: agentId, companyId, name: "A", role: "engineer", status: "active",
+        adapterType: agentAdapter, adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId, companyId, title: "Reset the runner", status: "backlog", priority: "medium",
+        assigneeAgentId: agentId, assigneeAdapterOverrides: { adapterType: overrideAdapter },
+      });
+      // The issue's live session is stored under the OVERRIDE adapter (not the
+      // agent default). A stray session for an unrelated task must survive.
+      await db.insert(agentTaskSessions).values([
+        { companyId, agentId, adapterType: overrideAdapter, taskKey: issueId },
+        { companyId, agentId, adapterType: agentAdapter, taskKey: otherTaskKey },
+      ]);
+
+      const result = await heartbeatService(db).resetRuntimeSession(agentId, { taskKey: issueId });
+
+      // Pre-fix (clear scoped to agent.adapterType) would match nothing and reset 0.
+      expect(result?.clearedTaskSessions).toBe(1);
+      const rows = await db
+        .select({ taskKey: agentTaskSessions.taskKey })
+        .from(agentTaskSessions)
+        .where(eq(agentTaskSessions.agentId, agentId));
+      expect(rows.filter((r) => r.taskKey === issueId)).toHaveLength(0);
       expect(rows.filter((r) => r.taskKey === otherTaskKey)).toHaveLength(1);
     },
   );

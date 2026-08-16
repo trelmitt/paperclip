@@ -8349,16 +8349,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  // Backlog G / P4: the pre-execute resolvers (session-before, resumable-workspace,
+  // explicit resume, operator reset) must key on the SAME effective adapter that executeRun
+  // will run under, or on a per-issue runner override they read/clear the wrong
+  // agent_task_sessions row (keyed on adapterType) and silently no-op. Mirrors executeRun's
+  // resolution: an override applies only when this agent is the issue's assignee.
+  // taskKey === issueId for issue-scoped wakes; synthetic/identifier/absent keys resolve to
+  // the agent's own adapter (one cheap PK lookup, guarded on a UUID-like key).
+  async function resolveEffectiveAdapterTypeForTaskKey(
+    agent: typeof agents.$inferSelect,
+    taskKey: string | null,
+  ): Promise<string> {
+    if (!taskKey || !isUuidLike(taskKey)) return agent.adapterType;
+    const issueRow = await db
+      .select({
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, taskKey), eq(issues.companyId, agent.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issueRow || issueRow.assigneeAgentId !== agent.id) return agent.adapterType;
+    return (
+      parseIssueAssigneeAdapterOverrides(issueRow.assigneeAdapterOverrides)?.adapterType ??
+      agent.adapterType
+    );
+  }
+
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
   ) {
     if (taskKey) {
-      const codec = getAdapterSessionCodec(agent.adapterType);
+      const effectiveAdapterType = await resolveEffectiveAdapterTypeForTaskKey(agent, taskKey);
+      const codec = getAdapterSessionCodec(effectiveAdapterType);
       const existingTaskSession = await getTaskSession(
         agent.companyId,
         agent.id,
-        agent.adapterType,
+        effectiveAdapterType,
         taskKey,
       );
       const parsedParams = normalizeSessionParams(
@@ -8394,15 +8422,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (shouldResetTaskSessionForWake(input.contextSnapshot)) return false;
     if (!input.taskKey) return false;
 
-    const codec = getAdapterSessionCodec(input.agent.adapterType);
+    const effectiveAdapterType = await resolveEffectiveAdapterTypeForTaskKey(
+      input.agent,
+      input.taskKey,
+    );
+    const codec = getAdapterSessionCodec(effectiveAdapterType);
     const taskSession = await getTaskSession(
       input.agent.companyId,
       input.agent.id,
-      input.agent.adapterType,
+      effectiveAdapterType,
       input.taskKey,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
-      input.agent.adapterType,
+      effectiveAdapterType,
       codec.deserialize(taskSession?.sessionParamsJson ?? null),
     );
     return hasResolvableSessionWorkspaceCwd(taskSessionParams);
@@ -8437,16 +8469,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const resumeContext = parseObject(resumeRun.contextSnapshot);
     const resumeTaskKey = deriveTaskKey(resumeContext, null) ?? taskKey;
+    const effectiveAdapterType = await resolveEffectiveAdapterTypeForTaskKey(agent, resumeTaskKey);
     const resumeTaskSession = resumeTaskKey
-      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
+      ? await getTaskSession(agent.companyId, agent.id, effectiveAdapterType, resumeTaskKey)
       : null;
-    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
+    const sessionCodec = getAdapterSessionCodec(effectiveAdapterType);
     const resumeRunResult = parseObject(resumeRun.resultJson);
-    const resumeRunSessionId = requiresCanonicalSessionIds(agent.adapterType)
+    const resumeRunSessionId = requiresCanonicalSessionIds(effectiveAdapterType)
       ? readNonEmptyString(resumeRunResult.sessionId) ?? readNonEmptyString(resumeRunResult.session_id)
       : null;
     const sessionOverride = buildExplicitResumeSessionOverride({
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       resumeFromRunId,
       resumeRunSessionIdBefore: resumeRun.sessionIdBefore,
       resumeRunSessionIdAfter: resumeRun.sessionIdAfter,
@@ -18903,10 +18936,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!agent) throw notFound("Agent not found");
       await ensureRuntimeState(agent);
       const taskKey = readNonEmptyString(opts?.taskKey);
+      // G/P4: clear by taskKey across ALL adapters. A per-issue runner override stores its
+      // session under the override adapter, not agent.adapterType, so scoping the clear to
+      // agent.adapterType would leave the override's session intact and make the operator
+      // "reset this issue" a silent no-op. taskKey === issueId runs under one adapter at a
+      // time, so an unscoped-by-adapter clear resets exactly that issue's session.
       const clearedTaskSessions = await clearTaskSessions(
         agent.companyId,
         agent.id,
-        taskKey ? { taskKey, adapterType: agent.adapterType } : undefined,
+        taskKey ? { taskKey } : undefined,
       );
       const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
         sessionId: null,
