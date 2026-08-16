@@ -135,6 +135,10 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import { getBuiltInAgentDefinition } from "../services/built-in-agents.js";
+import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
+import { findServerAdapter, listServerAdapters } from "../adapters/registry.js";
+import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
   decideIssueReviewPathRecovery,
@@ -4624,6 +4628,67 @@ export function issueRoutes(
     return false;
   }
 
+  // G (per-issue runner override): a per-issue `adapterType` reroutes the
+  // assignee's whole runner, so it is validated here at write time —
+  // "constrain to the agent's allowed adapters, never escalate". Two layers:
+  //   1. Instance floor (every agent): the type must be known + enabled on this
+  //      instance (same rule as agent create/hire — see assertSelectableAdapterType
+  //      in routes/agents.ts). You cannot force an adapter the instance curated out.
+  //   2. Built-in allowlist: `allowedAdapterTypes` exists ONLY on built-in agent
+  //      definitions; a built-in assignee's override must stay inside it. Regular
+  //      agents carry no per-agent allowlist, so the instance floor is their
+  //      constraint. Absent/blank adapterType (e.g. a model-only override) is a
+  //      no-op here.
+  async function assertIssueAssigneeAdapterOverrideAllowed(
+    companyId: string,
+    input: { assigneeAdapterOverrides?: unknown; assigneeAgentId?: unknown },
+    fallbackAssigneeAgentId: string | null,
+  ) {
+    const overrides = input.assigneeAdapterOverrides;
+    const rawType = overrides && typeof overrides === "object" && !Array.isArray(overrides)
+      ? (overrides as Record<string, unknown>).adapterType
+      : undefined;
+    if (typeof rawType !== "string" || !rawType.trim()) return;
+    const adapterType = rawType.trim();
+
+    // Layer 1 — known + enabled on this instance.
+    if (!findServerAdapter(adapterType)) {
+      throw unprocessable(`Unknown adapter type: ${adapterType}`);
+    }
+    const disabled = new Set(getDisabledAdapterTypes());
+    if (disabled.has(adapterType)) {
+      const available = listServerAdapters().map((a) => a.type).filter((t) => !disabled.has(t)).sort();
+      throw unprocessable(
+        `Adapter "${adapterType}" is not available on this instance. `
+        + `Available adapters: ${available.length > 0 ? available.join(", ") : "(none configured)"}`,
+      );
+    }
+
+    // Layer 2 — built-in assignee allowlist.
+    const bodyAssignee = typeof input.assigneeAgentId === "string" && input.assigneeAgentId.trim()
+      ? input.assigneeAgentId.trim()
+      : undefined;
+    const assigneeAgentId = bodyAssignee ?? fallbackAssigneeAgentId;
+    if (!assigneeAgentId) return;
+    const agentRow = await db
+      .select({ metadata: agents.metadata })
+      .from(agents)
+      .where(and(eq(agents.id, assigneeAgentId), eq(agents.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!agentRow) return;
+    const marker = readBuiltInAgentMarker(agentRow.metadata);
+    const definition = marker?.key ? getBuiltInAgentDefinition(marker.key) : null;
+    if (definition?.allowedAdapterTypes && !definition.allowedAdapterTypes.includes(adapterType)) {
+      throw forbidden(`Adapter "${adapterType}" is not permitted for built-in agent ${definition.key}`, {
+        code: "issue_assignee_adapter_override_not_allowed",
+        adapterType,
+        allowedAdapterTypes: definition.allowedAdapterTypes,
+        agentId: assigneeAgentId,
+        builtInAgentKey: definition.key,
+      });
+    }
+  }
+
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
@@ -7953,6 +8018,7 @@ export function issueRoutes(
         : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, createBody))) return;
+    await assertIssueAssigneeAdapterOverrideAllowed(companyId, createBody, null);
     const createAssignmentScope = {
       projectId: await resolveAssignmentProjectId({
         companyId,
@@ -8189,6 +8255,7 @@ export function issueRoutes(
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
+    await assertIssueAssigneeAdapterOverrideAllowed(parent.companyId, createBody, null);
     const childAssignmentScope = {
       projectId: createBody.projectId ?? parent.projectId ?? null,
       parentIssueId: parent.id,
@@ -8368,6 +8435,7 @@ export function issueRoutes(
       requestedChildren.push(childBody);
       assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(childBody));
       if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, sourceIssue, childBody))) return;
+      await assertIssueAssigneeAdapterOverrideAllowed(sourceIssue.companyId, childBody, null);
       if (childBody.assigneeAgentId || childBody.assigneeUserId) {
         await assertCanAssignTasks(req, sourceIssue.companyId, {
           projectId: childBody.projectId ?? sourceIssue.projectId ?? null,
@@ -8739,6 +8807,7 @@ export function issueRoutes(
       ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
       : issueWriteAuthorizationReason(req, true);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
+    await assertIssueAssigneeAdapterOverrideAllowed(existing.companyId, req.body, existing.assigneeAgentId);
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);

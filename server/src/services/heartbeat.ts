@@ -2508,6 +2508,8 @@ interface ParsedIssueAssigneeAdapterOverrides {
   modelProfile: ModelProfileKey | null;
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
+  /** Backlog G: per-issue runner override; null falls back to the agent's adapter. */
+  adapterType: string | null;
 }
 
 type ModelProfileRequestSource = "issue_override" | "wake_context";
@@ -3996,11 +3998,16 @@ function parseIssueAssigneeAdapterOverrides(
     typeof parsed.useProjectWorkspace === "boolean"
       ? parsed.useProjectWorkspace
       : null;
-  if (!modelProfile && !adapterConfig && useProjectWorkspace === null) return null;
+  const adapterType =
+    typeof parsed.adapterType === "string" && parsed.adapterType.trim().length > 0
+      ? parsed.adapterType.trim()
+      : null;
+  if (!modelProfile && !adapterConfig && useProjectWorkspace === null && !adapterType) return null;
   return {
     modelProfile,
     adapterConfig,
     useProjectWorkspace,
+    adapterType,
   };
 }
 
@@ -13638,7 +13645,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
-    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
     const issueDependencyReadiness = issueId
@@ -13708,6 +13714,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueContext.assigneeAdapterOverrides,
           )
         : null;
+    // Backlog G: per-issue runner override. The entire run — execution adapter, session
+    // read/write key, codec, config fingerprint, environment acquisition, telemetry — keys
+    // off this effective adapter, so a create-time override runs on (and isolates a fresh
+    // session for) the overridden provider. Validated at write time against the agent's
+    // allowed adapters (no escalation); falls back to the agent's configured adapter. The
+    // session READ (getTaskSession) and WRITES (upsert/clearTaskSessions) MUST use the same
+    // value or the task session thrashes every heartbeat.
+    const effectiveAdapterType = issueAssigneeOverrides?.adapterType ?? agent.adapterType;
+    const sessionCodec = getAdapterSessionCodec(effectiveAdapterType);
     const experimentalInstanceSettings = await instanceSettings.getExperimental();
     const isolatedWorkspacesEnabled = experimentalInstanceSettings.enableIsolatedWorkspaces;
     const parsedIssueExecutionWorkspaceSettings = parseIssueExecutionWorkspaceSettings(
@@ -13816,13 +13831,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const config = parseObject(agent.adapterConfig);
     const taskSession = taskKey
-      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+      ? await getTaskSession(agent.companyId, agent.id, effectiveAdapterType, taskKey)
       : null;
     const taskSessionDecodedParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
     );
     const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
-      agent.adapterType,
+      effectiveAdapterType,
       sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
     );
     const explicitResumeSessionDisplayId = truncateDisplayId(
@@ -14181,7 +14196,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let adapterModelProfiles: AdapterModelProfileDefinition[] = [];
     let profileResolutionFallbackReason: string | null = null;
     try {
-      adapterModelProfiles = await listAdapterModelProfiles(agent.adapterType);
+      adapterModelProfiles = await listAdapterModelProfiles(effectiveAdapterType);
     } catch (error) {
       profileResolutionFallbackReason = "adapter_profile_resolution_failed";
       logger.warn(
@@ -14189,7 +14204,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           err: error,
           companyId: agent.companyId,
           agentId: agent.id,
-          adapterType: agent.adapterType,
+          adapterType: effectiveAdapterType,
           runId: run.id,
         },
         "Failed to resolve adapter model profiles; falling back to primary adapter config",
@@ -14222,14 +14237,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId,
     });
     const pushCapabilityPreflightRequired = requiresPushCapabilityPreflight({
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       issueId,
       explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
     });
     const { resolvedConfig, secretKeys, secretManifest } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,
       agentId: agent.id,
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       issueId,
       heartbeatRunId: run.id,
       environmentId: selectedEnvironmentForConfig?.id ?? null,
@@ -14276,7 +14291,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       effectiveAdapterConfig: runtimeConfig,
       agentRuntimeConfig: agent.runtimeConfig,
       modelProfile: modelProfileMetadata,
@@ -14349,11 +14364,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     const previousSessionParams =
       explicitResumeSessionParams ??
-      (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
+      (isCanonicalSessionIdForAdapter(effectiveAdapterType, explicitResumeSessionDisplayId)
         ? { sessionId: explicitResumeSessionDisplayId }
         : null) ??
       normalizeResumeParamsForAdapter(
-        agent.adapterType,
+        effectiveAdapterType,
         stripPaperclipSessionMetadataFromSessionParams(
           sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
         ),
@@ -14780,7 +14795,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: agent.companyId,
       selectedEnvironmentId,
       localEnvironmentId: localEnvironment.id,
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       issueId: issueId ?? null,
       heartbeatRunId: run.id,
       agentId: agent.id,
@@ -14820,7 +14835,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const realizationResult = await envOrchestrator.realizeForRun({
       environment: selectedEnvironment,
       lease: activeEnvironmentLease.lease,
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       companyId: agent.companyId,
       issueId: issueId ?? null,
       heartbeatRunId: run.id,
@@ -15006,7 +15021,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const runtimeSessionFallback = taskKey || resetTaskSession
       ? null
-      : isCanonicalSessionIdForAdapter(agent.adapterType, runtime.sessionId)
+      : isCanonicalSessionIdForAdapter(effectiveAdapterType, runtime.sessionId)
         ? runtime.sessionId
         : null;
     const runtimeSessionDisplayId = truncateDisplayId(
@@ -15016,10 +15031,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runtimeSessionParams?.sessionId) ??
         runtimeSessionFallback,
     );
-    let previousSessionDisplayId = requiresCanonicalSessionIds(agent.adapterType)
+    let previousSessionDisplayId = requiresCanonicalSessionIds(effectiveAdapterType)
       ? truncateDisplayId(
           readNonEmptyString(previousSessionParams?.sessionId) ??
-            (isCanonicalSessionIdForAdapter(agent.adapterType, runtimeSessionDisplayId) ? runtimeSessionDisplayId : null) ??
+            (isCanonicalSessionIdForAdapter(effectiveAdapterType, runtimeSessionDisplayId) ? runtimeSessionDisplayId : null) ??
             runtimeSessionFallback,
         )
       : runtimeSessionDisplayId;
@@ -15292,7 +15307,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await onLog(logEntry.stream, logEntry.chunk);
       }
       await assertGitSensitiveAdapterWorkspaceValid({
-        adapterType: agent.adapterType,
+        adapterType: effectiveAdapterType,
         agentId: agent.id,
         issue: issueRef
           ? {
@@ -15401,7 +15416,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
-      const adapter = getServerAdapter(agent.adapterType);
+      const adapter = getServerAdapter(effectiveAdapterType);
       const localAgentJwtScope =
         issueRef?.workMode === "skill_test"
           ? { kind: "skill_test" as const, issueId: issueRef.id }
@@ -15410,7 +15425,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? createLocalAgentJwt(
           agent.id,
           agent.companyId,
-          agent.adapterType,
+          effectiveAdapterType,
           run.id,
           run.responsibleUserId,
           localAgentJwtScope,
@@ -15422,7 +15437,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             companyId: agent.companyId,
             agentId: agent.id,
             runId: run.id,
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
           },
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
@@ -15510,7 +15525,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   phase: "workspace_finalize",
                   cwd: executionWorkspace.cwd,
                   metadata: {
-                    adapterType: agent.adapterType,
+                    adapterType: effectiveAdapterType,
                     executionTargetKind: executionTarget?.kind ?? "local",
                     ...metadata,
                     managedGitWorktreeBranch: finalizeBranchMetadata,
@@ -15557,7 +15572,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 phase: "workspace_finalize",
                 cwd: executionWorkspace.cwd,
                 metadata: {
-                  adapterType: agent.adapterType,
+                  adapterType: effectiveAdapterType,
                   executionTargetKind: executionTarget?.kind ?? "local",
                   ...metadata,
                   managedGitWorktreeBranch: finalizeBranchMetadata,
@@ -15575,7 +15590,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   workspaceValidation: {
                     reason: "git_worktree_branch_incoherence",
                     fingerprint: workspaceValidationFingerprint,
-                    adapterType: agent.adapterType,
+                    adapterType: effectiveAdapterType,
                     issueId: issueRef?.id ?? null,
                     issueIdentifier: issueRef?.identifier ?? null,
                     persistedExecutionWorkspaceId: branchInspection.workspaceRecord.id,
@@ -15591,7 +15606,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           phase: "workspace_finalize",
           cwd: executionWorkspace.cwd,
           metadata: {
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
             executionTargetKind: executionTarget?.kind ?? "local",
             ...metadata,
             ...(finalizeBranchMetadata ? { managedGitWorktreeBranch: finalizeBranchMetadata } : {}),
@@ -15732,7 +15747,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
             runId: run.id,
             agent: {
               id: agent.id,
@@ -15790,7 +15805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const nextSessionState = resolveNextSessionState({
-        adapterType: agent.adapterType,
+        adapterType: effectiveAdapterType,
         codec: sessionCodec,
         adapterResult,
         outcome,
@@ -16065,13 +16080,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
-              adapterType: agent.adapterType,
+              adapterType: effectiveAdapterType,
             });
           } else {
             await upsertTaskSession({
               companyId: agent.companyId,
               agentId: agent.id,
-              adapterType: agent.adapterType,
+              adapterType: effectiveAdapterType,
               taskKey,
               sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
                 nextSessionState.params,
@@ -16205,7 +16220,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
             taskKey,
             sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
               previousSessionParams,

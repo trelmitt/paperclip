@@ -479,6 +479,29 @@ describe("issue validators", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("accepts a per-issue adapterType override (G runner override)", () => {
+    const parsed = createIssueSchema.parse({
+      title: "Route this issue to a different runner",
+      assigneeAdapterOverrides: {
+        adapterType: "gemini_local",
+        adapterConfig: { model: "gemini-3-pro" },
+      },
+    });
+
+    expect(parsed.assigneeAdapterOverrides?.adapterType).toBe("gemini_local");
+    expect(parsed.assigneeAdapterOverrides?.adapterConfig).toEqual({ model: "gemini-3-pro" });
+  });
+
+  it("rejects a blank adapterType override", () => {
+    const parsed = updateIssueSchema.safeParse({
+      assigneeAdapterOverrides: {
+        adapterType: "   ",
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
   it("validates agent runtime cheap model profile config without rejecting other runtime fields", () => {
     const parsed = createAgentSchema.parse({
       name: "Coder",

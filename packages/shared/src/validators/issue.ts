@@ -33,6 +33,7 @@ import {
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
+import { optionalAgentAdapterTypeSchema } from "../adapter-type.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
@@ -179,6 +180,9 @@ export const issueAssigneeAdapterOverridesSchema = z
     modelProfile: z.enum(MODEL_PROFILE_KEYS).optional(),
     adapterConfig: z.record(z.string(), z.unknown()).optional(),
     useProjectWorkspace: z.boolean().optional(),
+    // Backlog G: per-issue runner override. Shape-only here (non-empty string); the
+    // known/enabled + agent-allowed checks run at write time in routes/issues.ts.
+    adapterType: optionalAgentAdapterTypeSchema,
   })
   .strict();
 

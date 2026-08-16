@@ -88,6 +88,13 @@ export interface IssueAssigneeAdapterOverrides {
   modelProfile?: ModelProfileKey;
   adapterConfig?: Record<string, unknown>;
   useProjectWorkspace?: boolean;
+  /**
+   * Backlog G: per-issue runner override. When set, this issue runs on this adapter
+   * instead of the assigned agent's default, resolved with agent fallback in heartbeat.ts.
+   * Validated at write time against the agent's allowed adapters (no escalation). A
+   * per-issue model rides `adapterConfig.model` (it wins the adapter-config merge).
+   */
+  adapterType?: string;
 }
 
 export type DocumentFormat = "markdown";
