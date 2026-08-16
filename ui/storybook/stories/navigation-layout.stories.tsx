@@ -6,6 +6,7 @@ import {
   House,
   Inbox,
   LayoutDashboard,
+  ShieldCheck,
   SquarePen,
   Users,
 } from "lucide-react";
@@ -121,15 +122,16 @@ const mobileNavItems = [
   { label: "Issues", icon: CircleDot },
   { label: "Create", icon: SquarePen },
   { label: "Agents", icon: Users },
+  { label: "Approvals", icon: ShieldCheck, badge: storybookSidebarBadges.approvals },
   { label: "Inbox", icon: Inbox, badge: storybookSidebarBadges.inbox },
 ];
 
 function MobileBottomNavActiveStateMatrix() {
   return (
-    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
       {mobileNavItems.map((activeItem) => (
         <div key={activeItem.label} className="overflow-hidden border border-border bg-background">
-          <div className="grid h-16 grid-cols-5 px-1">
+          <div className="grid h-16 grid-cols-6 px-1">
             {mobileNavItems.map((item) => {
               const Icon = item.icon;
               const active = item.label === activeItem.label;
