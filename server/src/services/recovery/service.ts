@@ -80,6 +80,7 @@ import {
 } from "./issue-graph-liveness.js";
 import {
   recoveryAssigneeAdapterOverrides,
+  withRecoveryEscalationHint,
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
@@ -1136,27 +1137,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    attemptCount?: number;
   }) {
+    // >=2 failed attempts -> route this GENUINE re-attempt to the strong model. withRecoveryEscalationHint
+    // stamps modelProfile:"escalate" AFTER the normal_model scrub and only on the per-wake payload/context
+    // (never the issue override column). See its docstring for the two invariants it enforces.
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
-      payload: withRecoveryModelProfileHint({
-        issueId: input.issueId,
-        ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
-        ...(input.extraContext ?? {}),
-      }, "normal_model"),
+      payload: withRecoveryEscalationHint(
+        withRecoveryModelProfileHint({
+          issueId: input.issueId,
+          ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+          ...(input.extraContext ?? {}),
+        }, "normal_model"),
+        input.attemptCount,
+      ),
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: input.issueId,
-        taskId: input.issueId,
-        wakeReason: input.reason,
-        retryReason: input.retryReason,
-        source: input.source,
-        ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
-        ...(input.extraContext ?? {}),
-      }, "normal_model"),
+      contextSnapshot: withRecoveryEscalationHint(
+        withRecoveryModelProfileHint({
+          issueId: input.issueId,
+          taskId: input.issueId,
+          wakeReason: input.reason,
+          retryReason: input.retryReason,
+          source: input.source,
+          ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+          ...(input.extraContext ?? {}),
+        }, "normal_model"),
+        input.attemptCount,
+      ),
     });
 
     if (queued && input.retryOfRunId) {
@@ -4268,6 +4279,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         continue;
       }
+      // Carries the genuine repeated-failure count out to the re-attempt enqueue below, so a task
+      // that has failed >=2 times gets the strong ("escalate") model on its next real retry.
+      let continuationFailureCount = 0;
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         const classification = classifyContinuationFailure(latestRun);
 
@@ -4310,6 +4324,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             agentId,
             classification.errorCode,
           );
+          continuationFailureCount = consecutive;
           if (consecutive >= classification.maxAttempts) {
             const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
             const updated = await escalateStrandedAssignedIssue({
@@ -4358,6 +4373,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        attemptCount: continuationFailureCount,
       });
       if (queued) {
         result.continuationRequeued += 1;
