@@ -73,3 +73,6 @@ tests/storybook-visual/playwright-report/
 # rollback/build snapshots (fleet-audit round 3 ratchet)
 *.bak
 dist.bak-*/
+
+*.bak*
+server/ui-dist/
