@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import { activityLog, agents, companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -26,6 +27,10 @@ const DISABLED_ADAPTERS = new Set(getDisabledAdapterTypes());
 const ENABLED_NOT_ALLOWED_FOR_BRIEFS = listServerAdapters()
   .map((a) => a.type)
   .find((t) => !DISABLED_ADAPTERS.has(t) && !BRIEFS_ALLOWED.has(t));
+// The mirror: an enabled adapter that the "briefs" built-in IS allowed to use.
+const ENABLED_ALLOWED_FOR_BRIEFS = listServerAdapters()
+  .map((a) => a.type)
+  .find((t) => !DISABLED_ADAPTERS.has(t) && BRIEFS_ALLOWED.has(t));
 
 // Phase 1 (model/adapter coherence): declare a deterministic model list for one
 // enabled adapter (via PAPERCLIP_ADAPTER_MODELS, set in beforeAll) so the model
@@ -63,6 +68,7 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
@@ -285,6 +291,92 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.code ?? res.body.details?.code).toBe("issue_assignee_adapter_override_not_allowed");
+    },
+  );
+
+  it.skipIf(!ENABLED_NOT_ALLOWED_FOR_BRIEFS)(
+    "Phase 3: auto-strips a persisted adapter pin when the issue is reassigned without a new override",
+    async () => {
+      const pinnedAdapter = ENABLED_NOT_ALLOWED_FOR_BRIEFS!;
+      const companyId = randomUUID();
+      const agentA = randomUUID();
+      const agentB = randomUUID();
+      const issueId = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      // A is a regular agent (any enabled adapter is fine for it); B is the
+      // built-in "briefs" that MUST NOT run pinnedAdapter. The persisted pin was
+      // authorized against A; reassigning to B without a new override must strip
+      // it, not let B silently run the disallowed adapter.
+      await db.insert(agents).values([
+        {
+          id: agentA, companyId, name: "A", role: "engineer", status: "active",
+          adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        },
+        {
+          id: agentB, companyId, name: "Briefs B", role: "analyst", status: "active",
+          adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+          metadata: { paperclipBuiltInAgent: { key: "briefs", featureKeys: ["briefs"] } },
+        },
+      ]);
+      await db.insert(issues).values({
+        id: issueId, companyId, title: "Pinned to A's runner", status: "backlog", priority: "medium",
+        assigneeAgentId: agentA, assigneeAdapterOverrides: { adapterType: pinnedAdapter },
+      });
+
+      const res = await request(createApp(companyId))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: agentB });
+
+      expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+      const row = await db
+        .select({ overrides: issues.assigneeAdapterOverrides, assignee: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(row?.assignee).toBe(agentB);
+      // Override was adapterType-only, so stripping it empties the object -> null.
+      expect(row?.overrides).toBeNull();
+    },
+  );
+
+  it.skipIf(!ENABLED_ALLOWED_FOR_BRIEFS)(
+    "Phase 3: preserves an override the same PATCH explicitly supplies for the new assignee",
+    async () => {
+      const newAdapter = ENABLED_ALLOWED_FOR_BRIEFS!;
+      const companyId = randomUUID();
+      const agentA = randomUUID();
+      const agentB = randomUUID();
+      const issueId = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      await db.insert(agents).values([
+        {
+          id: agentA, companyId, name: "A", role: "engineer", status: "active",
+          adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        },
+        {
+          id: agentB, companyId, name: "Briefs B", role: "analyst", status: "active",
+          adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+          metadata: { paperclipBuiltInAgent: { key: "briefs", featureKeys: ["briefs"] } },
+        },
+      ]);
+      await db.insert(issues).values({
+        id: issueId, companyId, title: "Reassign with a fresh override", status: "backlog", priority: "medium",
+        assigneeAgentId: agentA, assigneeAdapterOverrides: { adapterType: "claude_local" },
+      });
+
+      // Explicit new override in the same PATCH is respected (and gate-validated
+      // against B), NOT auto-stripped.
+      const res = await request(createApp(companyId))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: agentB, assigneeAdapterOverrides: { adapterType: newAdapter } });
+
+      expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+      const row = await db
+        .select({ overrides: issues.assigneeAdapterOverrides })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect((row?.overrides as { adapterType?: string } | null)?.adapterType).toBe(newAdapter);
     },
   );
 });

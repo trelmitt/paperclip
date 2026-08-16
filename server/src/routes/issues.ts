@@ -8876,6 +8876,24 @@ export function issueRoutes(
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
       ...updateFields
     } = req.body;
+    // G Phase 3 — authority re-validation on reassignment (auto-strip). A
+    // persisted assigneeAdapterOverrides.adapterType was authorized against the
+    // OLD assignee. If this PATCH reassigns the issue to a different agent
+    // without supplying a new override, the pin would silently carry over and
+    // could run an adapter outside the new assignee's allowlist (a Layer-2
+    // bypass — the gate above only sees the override in the request body). Strip
+    // the pinned adapterType so the new assignee falls back to its own adapter;
+    // this also drops the old-adapter pin that could otherwise resurface a stale
+    // session on a later swap-back. The caller can still set a fresh override in
+    // the same PATCH (that path is gate-validated against the new assignee).
+    const reassignsToDifferentAgent =
+      normalizedAssigneeAgentId !== undefined && normalizedAssigneeAgentId !== existing.assigneeAgentId;
+    const bodyProvidesAdapterOverrides = Object.prototype.hasOwnProperty.call(req.body, "assigneeAdapterOverrides");
+    const persistedAdapterOverrides = existing.assigneeAdapterOverrides;
+    if (reassignsToDifferentAgent && !bodyProvidesAdapterOverrides && persistedAdapterOverrides?.adapterType) {
+      const { adapterType: _strippedAdapterType, ...retainedOverride } = persistedAdapterOverrides;
+      updateFields.assigneeAdapterOverrides = Object.keys(retainedOverride).length > 0 ? retainedOverride : null;
+    }
     const effectiveReviewPolicy = req.body.reviewPolicy === undefined
       ? existing.reviewPolicy
       : req.body.reviewPolicy;
