@@ -27,6 +27,14 @@ const ENABLED_NOT_ALLOWED_FOR_BRIEFS = listServerAdapters()
   .map((a) => a.type)
   .find((t) => !DISABLED_ADAPTERS.has(t) && !BRIEFS_ALLOWED.has(t));
 
+// Phase 1 (model/adapter coherence): declare a deterministic model list for one
+// enabled adapter (via PAPERCLIP_ADAPTER_MODELS, set in beforeAll) so the model
+// check has a known-good id and a known-bad id to validate against without a
+// live CLI. FLOOR_OK_ADAPTER passes the instance floor.
+const FLOOR_OK_ADAPTER = listServerAdapters().map((a) => a.type).find((t) => !DISABLED_ADAPTERS.has(t));
+const DECLARED_MODEL_ID = "phase1-valid-model";
+const UNKNOWN_MODEL_ID = "__no_such_model__";
+
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres issue assignee adapter override tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
@@ -41,8 +49,15 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let priorAdapterModelsEnv: string | undefined;
 
   beforeAll(async () => {
+    priorAdapterModelsEnv = process.env.PAPERCLIP_ADAPTER_MODELS;
+    if (FLOOR_OK_ADAPTER) {
+      process.env.PAPERCLIP_ADAPTER_MODELS = JSON.stringify({
+        [FLOOR_OK_ADAPTER]: [{ id: DECLARED_MODEL_ID, label: "Phase 1 valid model" }],
+      });
+    }
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-adapter-override-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
@@ -56,6 +71,8 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
   });
 
   afterAll(async () => {
+    if (priorAdapterModelsEnv === undefined) delete process.env.PAPERCLIP_ADAPTER_MODELS;
+    else process.env.PAPERCLIP_ADAPTER_MODELS = priorAdapterModelsEnv;
     await tempDb?.cleanup();
   });
 
@@ -159,6 +176,111 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
           title: "Escalate a built-in onto a disallowed runner",
           assigneeAgentId,
           assigneeAdapterOverrides: { adapterType: overrideType },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.code ?? res.body.details?.code).toBe("issue_assignee_adapter_override_not_allowed");
+    },
+  );
+
+  it.skipIf(!FLOOR_OK_ADAPTER)(
+    "Phase 1: rejects an override whose adapterConfig.model is unknown for the target adapter",
+    async () => {
+      const adapter = FLOOR_OK_ADAPTER!;
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: adapter,
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const res = await request(createApp(companyId))
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          title: "Swap onto a model the adapter cannot run",
+          assigneeAgentId,
+          assigneeAdapterOverrides: { adapterType: adapter, adapterConfig: { model: UNKNOWN_MODEL_ID } },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code ?? res.body.details?.code).toBe("issue_assignee_adapter_override_model_unknown");
+      expect(res.body.details?.availableModelIds ?? []).toContain(DECLARED_MODEL_ID);
+    },
+  );
+
+  it.skipIf(!FLOOR_OK_ADAPTER)(
+    "Phase 1: rejects a swap that inherits a model the target adapter cannot run",
+    async () => {
+      const adapter = FLOOR_OK_ADAPTER!;
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      // Agent configured with a model that is NOT in the target adapter's list.
+      // The override supplies only adapterType (no model, no profile), so the
+      // gate must validate the INHERITED model against the target adapter.
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: adapter,
+        adapterConfig: { model: UNKNOWN_MODEL_ID },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const res = await request(createApp(companyId))
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          title: "Swap that inherits an incoherent model",
+          assigneeAgentId,
+          assigneeAdapterOverrides: { adapterType: adapter },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code ?? res.body.details?.code).toBe("issue_assignee_adapter_override_model_unknown");
+    },
+  );
+
+  it.skipIf(!ENABLED_NOT_ALLOWED_FOR_BRIEFS)(
+    "Phase 1: a modelProfile-only override skips model coherence (reaches the allowlist check)",
+    async () => {
+      const overrideType = ENABLED_NOT_ALLOWED_FOR_BRIEFS!;
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      // Built-in "briefs" agent with an incoherent literal model. The override
+      // sets a modelProfile (which resolves per-adapter at run time), so the
+      // model check must be SKIPPED — flow reaches the allowlist and 403s on the
+      // disallowed adapter rather than 422-ing on the inherited model.
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Briefs",
+        role: "analyst",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: { model: UNKNOWN_MODEL_ID },
+        runtimeConfig: {},
+        permissions: {},
+        metadata: { paperclipBuiltInAgent: { key: "briefs", featureKeys: ["briefs"] } },
+      });
+
+      const res = await request(createApp(companyId))
+        .post(`/api/companies/${companyId}/issues`)
+        .send({
+          title: "Profile override must not trip the model check",
+          assigneeAgentId,
+          assigneeAdapterOverrides: { adapterType: overrideType, modelProfile: "cheap" },
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
