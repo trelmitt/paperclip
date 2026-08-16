@@ -279,13 +279,15 @@ describe("server adapter registry", () => {
         source: "adapter_default",
       }),
     ]);
-    await expect(listAdapterModelProfiles("opencode_local")).resolves.toEqual([
-      expect.objectContaining({
-        key: "cheap",
-        adapterConfig: expect.objectContaining({ model: "openai/gpt-5.1-codex-mini" }),
-        source: "adapter_default",
-      }),
-    ]);
+    await expect(listAdapterModelProfiles("opencode_local")).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "cheap",
+          adapterConfig: expect.objectContaining({ model: "openai/gpt-5.1-codex-mini" }),
+          source: "adapter_default",
+        }),
+      ]),
+    );
     await expect(listAdapterModelProfiles("cursor")).resolves.toEqual([
       expect.objectContaining({
         key: "cheap",

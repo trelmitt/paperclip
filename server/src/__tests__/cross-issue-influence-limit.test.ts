@@ -70,21 +70,23 @@ describe("cross-issue influence limit rollout", () => {
     });
   });
 
-  it("allows the twentieth influence and fails closed on the twenty-first after the flip", () => {
+  it("allows the last permitted influence and fails closed on the next after the flip", () => {
     const now = CROSS_ISSUE_INFLUENCE_ENFORCE_AT;
-    expect(evaluateCrossIssueInfluenceLimit({ priorCount: 19, now })).toMatchObject({
+    expect(
+      evaluateCrossIssueInfluenceLimit({ priorCount: CROSS_ISSUE_INFLUENCE_LIMIT - 1, now }),
+    ).toMatchObject({
       allowed: true,
       mode: "enforce",
-      count: 20,
-      cap: 20,
+      count: CROSS_ISSUE_INFLUENCE_LIMIT,
+      cap: CROSS_ISSUE_INFLUENCE_LIMIT,
     });
 
-    const rejected = evaluateCrossIssueInfluenceLimit({ priorCount: 20, now });
+    const rejected = evaluateCrossIssueInfluenceLimit({ priorCount: CROSS_ISSUE_INFLUENCE_LIMIT, now });
     expect(rejected).toMatchObject({
       allowed: false,
       mode: "enforce",
-      count: 21,
-      cap: 20,
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+      cap: CROSS_ISSUE_INFLUENCE_LIMIT,
     });
     const capError = crossIssueInfluenceLimitError(rejected, {
       actorLabel: "Fable",
@@ -92,17 +94,17 @@ describe("cross-issue influence limit rollout", () => {
     });
     expect(capError.details).toMatchObject({
       code: "cross_issue_influence_cap_exceeded",
-      cap: 20,
-      count: 21,
+      cap: CROSS_ISSUE_INFLUENCE_LIMIT,
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
       mode: "enforce",
       enforceAt: CROSS_ISSUE_INFLUENCE_ENFORCE_AT.toISOString(),
     });
     // Plan §6: the 429 names the boundary, who can act, and the way forward.
-    expect(capError.error).toContain("20");
+    expect(capError.error).toContain(String(CROSS_ISSUE_INFLUENCE_LIMIT));
     expect(capError.error).toContain("Who can act:");
     expect(capError.error).toContain("Try this:");
     expect(capError.error).toContain("next heartbeat");
-    expect(capError.details.boundary).toContain("20");
+    expect(capError.details.boundary).toContain(String(CROSS_ISSUE_INFLUENCE_LIMIT));
     expect(capError.details.whoCanAct).toContain("Fable");
   });
 

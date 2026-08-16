@@ -54,6 +54,7 @@ vi.mock("../components/PathInstructionsModal", () => ({ ChoosePathButton: () => 
 vi.mock("../components/WorkspaceRuntimeControls", () => ({
   buildWorkspaceRuntimeControlSections: () => [],
   WorkspaceRuntimeControls: () => <div data-testid="runtime-controls" />,
+  getRunningRuntimeServiceUrl: () => null,
 }));
 vi.mock("@/plugins/slots", () => ({
   PluginSlotMount: (props: unknown) => {

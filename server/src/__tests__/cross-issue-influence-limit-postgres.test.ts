@@ -14,6 +14,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+  CROSS_ISSUE_INFLUENCE_LIMIT,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.js";
 
@@ -40,7 +41,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     await tempDb?.cleanup();
   });
 
-  it("allows exactly one of concurrent attempts 20 and 21", async () => {
+  it("allows exactly one of two concurrent attempts at the cap boundary", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -72,7 +73,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       contextSnapshot: { issueId: sourceIssueId },
     });
     await db.insert(activityLog).values(
-      Array.from({ length: 19 }, () => ({
+      Array.from({ length: CROSS_ISSUE_INFLUENCE_LIMIT - 1 }, () => ({
         companyId,
         actorType: "agent" as const,
         actorId: agentId,
@@ -99,13 +100,16 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     ]);
 
     expect(decisions.map((decision) => decision?.allowed).sort()).toEqual([false, true]);
-    expect(decisions.map((decision) => decision?.count).sort((a, b) => Number(a) - Number(b))).toEqual([20, 21]);
+    expect(decisions.map((decision) => decision?.count).sort((a, b) => Number(a) - Number(b))).toEqual([
+      CROSS_ISSUE_INFLUENCE_LIMIT,
+      CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+    ]);
 
     const recorded = await db
       .select({ action: activityLog.action })
       .from(activityLog)
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
-    expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(20);
+    expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(CROSS_ISSUE_INFLUENCE_LIMIT);
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
   });
 });

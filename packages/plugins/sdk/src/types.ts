@@ -2145,6 +2145,6 @@ export interface PluginContext {
 // Execution utilities
 // ---------------------------------------------------------------------------
 
-import { checkShellCommandSafety } from "@paperclipai/adapter-utils";
+import { checkShellCommandSafety } from "@paperclipai/adapter-utils/execution-target";
 
 export { checkShellCommandSafety };

@@ -2382,5 +2382,10 @@ export {
   type InstanceFeatureKey,
 } from "./feature-catalog.js";
 
+// SafetyGuardDeclaration is a type (erased at build), so re-exporting it here is
+// browser-safe. checkShellCommandSafety is a runtime Node util and must NOT be
+// re-exported from this browser-shared barrel — it drags node:child_process
+// (via adapter-utils/git-workspace-sync) into the UI bundle and breaks vite build.
+// Server/plugin consumers import it from @paperclipai/plugin-sdk (which sources it
+// directly from @paperclipai/adapter-utils).
 export type { SafetyGuardDeclaration } from "@paperclipai/adapter-utils";
-export { checkShellCommandSafety } from "@paperclipai/adapter-utils";

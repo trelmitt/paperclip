@@ -96,4 +96,8 @@ export type {
   StartedSandboxCallbackBridgeServer,
 } from "./sandbox-callback-bridge.js";
 export type { SafetyGuardDeclaration } from "./execution-target.js";
-export { checkShellCommandSafety } from "./execution-target.js";
+// NOTE: checkShellCommandSafety is a runtime binding in execution-target.ts, which
+// statically imports node:child_process/net/fs (via ssh/sandbox-managed-runtime).
+// Re-exporting it from this dual-target barrel drags that Node graph into the
+// browser bundle and breaks `vite build`. Server/plugin consumers import it from
+// "@paperclipai/adapter-utils/execution-target" instead (see plugin-sdk).
