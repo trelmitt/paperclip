@@ -61,6 +61,21 @@ describe("issue subresource commands", () => {
     ]);
   });
 
+  it("sends a per-issue adapter override on update, and clears it with 'none'", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "update", ISSUE_ID, "--adapter-type", "codex_local", "--adapter-model", "gpt-5-codex"]);
+    await run(["issue", "update", ISSUE_ID, "--adapter-type", "none"]);
+
+    const bodies = fetchMock.mock.calls.map((call) => JSON.parse(String(call[1]?.body ?? "{}")));
+    expect(bodies[0].assigneeAdapterOverrides).toEqual({
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5-codex" },
+    });
+    expect(bodies[1].assigneeAdapterOverrides).toBeNull();
+  });
+
   it("wraps comments, approvals, markers, and recovery action endpoints", async () => {
     const fetchMock = vi
       .fn()

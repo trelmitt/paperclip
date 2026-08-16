@@ -76,6 +76,8 @@ interface IssueUpdateOptions extends BaseClientOptions {
   billingCode?: string;
   comment?: string;
   hiddenAt?: string;
+  adapterType?: string;
+  adapterModel?: string;
 }
 
 interface IssueCommentOptions extends BaseClientOptions {
@@ -329,6 +331,8 @@ export function registerIssueCommands(program: Command): void {
       .option("--billing-code <code>", "Billing code")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option("--adapter-type <type|none>", "Per-issue runner override: pin the assignee to this adapter for this issue; 'none' clears it")
+      .option("--adapter-model <id>", "Model for the per-issue runner override (used with --adapter-type)")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
@@ -345,6 +349,7 @@ export function registerIssueCommands(program: Command): void {
             billingCode: opts.billingCode,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
+            assigneeAdapterOverrides: parseAdapterOverrideOption(opts.adapterType, opts.adapterModel),
           });
 
           const updated = await ctx.api.patch<Issue & { comment?: IssueComment | null }>(apiPath`/api/issues/${issueId}`, payload);
@@ -1370,6 +1375,20 @@ function parseHiddenAt(value: string | undefined): string | null | undefined {
   if (value === undefined) return undefined;
   if (value.trim().toLowerCase() === "null") return null;
   return value;
+}
+
+// Per-issue runner override (G). undefined → leave untouched; "none"/"null"/"" → clear;
+// otherwise pin the adapterType (+ optional model). The host validates it against the
+// adapter-override gate, so an unknown/disabled/disallowed adapter is rejected server-side.
+function parseAdapterOverrideOption(
+  adapterType: string | undefined,
+  adapterModel: string | undefined,
+): { adapterType: string; adapterConfig?: { model: string } } | null | undefined {
+  if (adapterType === undefined) return undefined;
+  const type = adapterType.trim();
+  if (type === "" || type.toLowerCase() === "none" || type.toLowerCase() === "null") return null;
+  const model = adapterModel?.trim();
+  return model ? { adapterType: type, adapterConfig: { model } } : { adapterType: type };
 }
 
 function filterIssueRows(rows: Issue[], match: string | undefined): Issue[] {

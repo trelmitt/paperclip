@@ -1468,6 +1468,10 @@ export interface PluginIssuesClient {
       blockedByIssueIds?: string[];
       labelIds?: string[];
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      // Per-issue runner override (G). Validated host-side by the shared adapter-override
+      // gate on the plugin-host update path; reassigning without re-supplying this strips a
+      // stale adapter pin. `null` clears the override.
+      assigneeAdapterOverrides?: IssueAssigneeAdapterOverrides | null;
     },
     companyId: string,
     actor?: PluginIssueMutationActor,
