@@ -124,7 +124,10 @@ export function ActiveAgentsPanel({
     maxChunksPerRun: DASHBOARD_MAX_CHUNKS_PER_RUN,
     logPollIntervalMs: DASHBOARD_LOG_POLL_INTERVAL_MS,
     logReadLimitBytes: DASHBOARD_LOG_READ_LIMIT_BYTES,
-    enableRealtimeUpdates: false,
+    // Dashboard live cards use the realtime WebSocket as the primary source; the
+    // hook keeps only a slow (30s) fallback poll for reconnect gaps instead of
+    // the 15s cadence. Detail views already run realtime — match them here.
+    enableRealtimeUpdates: true,
   });
 
   return (
