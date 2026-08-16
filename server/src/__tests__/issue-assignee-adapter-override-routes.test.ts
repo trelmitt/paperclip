@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { activityLog, agents, companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -40,6 +40,13 @@ const FLOOR_OK_ADAPTER = listServerAdapters().map((a) => a.type).find((t) => !DI
 const DECLARED_MODEL_ID = "phase1-valid-model";
 const UNKNOWN_MODEL_ID = "__no_such_model__";
 
+// Phase 2 (cross-adapter session cleanup): two distinct enabled adapters to
+// swap between. Both clear the instance floor; a regular assignee has no
+// allowlist, so the swap is accepted and the clear runs.
+const ENABLED_ADAPTERS = listServerAdapters().map((a) => a.type).filter((t) => !DISABLED_ADAPTERS.has(t));
+const SWAP_FROM_ADAPTER = ENABLED_ADAPTERS[0];
+const SWAP_TO_ADAPTER = ENABLED_ADAPTERS.find((t) => t !== SWAP_FROM_ADAPTER);
+
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres issue assignee adapter override tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
@@ -69,6 +76,7 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(agentTaskSessions);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
@@ -377,6 +385,48 @@ describeEmbeddedPostgres("issue assignee adapterType override gate", () => {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       expect((row?.overrides as { adapterType?: string } | null)?.adapterType).toBe(newAdapter);
+    },
+  );
+
+  it.skipIf(!SWAP_FROM_ADAPTER || !SWAP_TO_ADAPTER)(
+    "Phase 2: a same-agent adapter swap clears the issue's task sessions across adapters, scoped to that issue",
+    async () => {
+      const fromAdapter = SWAP_FROM_ADAPTER!;
+      const toAdapter = SWAP_TO_ADAPTER!;
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const otherTaskKey = randomUUID();
+      await seedCompanyWithOwner(companyId);
+      await db.insert(agents).values({
+        id: agentId, companyId, name: "A", role: "engineer", status: "active",
+        adapterType: fromAdapter, adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId, companyId, title: "Swap the runner", status: "backlog", priority: "medium",
+        assigneeAgentId: agentId, assigneeAdapterOverrides: { adapterType: fromAdapter },
+      });
+      // Two sessions for THIS issue (the pinned adapter + a stray prior adapter),
+      // and one for an unrelated taskKey that must survive the scoped clear.
+      await db.insert(agentTaskSessions).values([
+        { companyId, agentId, adapterType: fromAdapter, taskKey: issueId },
+        { companyId, agentId, adapterType: "process", taskKey: issueId },
+        { companyId, agentId, adapterType: fromAdapter, taskKey: otherTaskKey },
+      ]);
+
+      const res = await request(createApp(companyId))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAdapterOverrides: { adapterType: toAdapter } });
+
+      expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+      const rows = await db
+        .select({ taskKey: agentTaskSessions.taskKey, adapterType: agentTaskSessions.adapterType })
+        .from(agentTaskSessions)
+        .where(eq(agentTaskSessions.agentId, agentId));
+      // Every session for the swapped issue is gone (across adapters)...
+      expect(rows.filter((r) => r.taskKey === issueId)).toHaveLength(0);
+      // ...but the unrelated task session is untouched (blast radius scoped).
+      expect(rows.filter((r) => r.taskKey === otherTaskKey)).toHaveLength(1);
     },
   );
 });

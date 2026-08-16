@@ -19011,6 +19011,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     wakeup: trackWakeup,
     triggerIssueMonitor,
 
+    // G Phase 2: clear every adapter's task session for one issue, so a per-issue
+    // runner swap (or override removal) can't later resurface a session keyed on
+    // the previous adapter (a diverged resume on swap-back). taskKey === issueId
+    // for issue-scoped runs; passing no adapterType makes clearTaskSessions
+    // delete across all adapters for that (company, agent, taskKey).
+    clearIssueTaskSessions: (companyId: string, agentId: string, issueId: string) =>
+      clearTaskSessions(companyId, agentId, { taskKey: issueId }),
+
     reportRunActivity: clearDetachedRunWarning,
 
     prepareHotRestartShutdown,

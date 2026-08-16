@@ -8894,6 +8894,33 @@ export function issueRoutes(
       const { adapterType: _strippedAdapterType, ...retainedOverride } = persistedAdapterOverrides;
       updateFields.assigneeAdapterOverrides = Object.keys(retainedOverride).length > 0 ? retainedOverride : null;
     }
+    // G Phase 2 — cross-adapter session cleanup on a same-agent runner swap. When
+    // this PATCH changes (or removes) the pinned adapterType for the CURRENT
+    // assignee, clear every adapter's task session for the issue so a later
+    // swap-back can't resume a diverged session keyed on the prior adapter.
+    // Reassignment is handled by the strip above (a different agent keys its
+    // sessions under its own id). Best-effort: a session-store hiccup must not
+    // fail the write, and a fresh session is always safe.
+    // ponytail: an in-flight run on the old adapter re-upserts its session on
+    // finalize (finish-then-swap), so this eager clear can leave a one-cycle
+    // orphan when a run is active mid-swap; the race-free upgrade is a run-path
+    // sibling sweep in executeRun — build that when SDK/CLI swap paths bypass
+    // this route.
+    if (!reassignsToDifferentAgent && existing.assigneeAgentId && bodyProvidesAdapterOverrides) {
+      const oldAdapterPin = persistedAdapterOverrides?.adapterType ?? null;
+      const bodyOverride = req.body.assigneeAdapterOverrides;
+      const newAdapterPin = bodyOverride && typeof bodyOverride === "object" && !Array.isArray(bodyOverride)
+        && typeof (bodyOverride as Record<string, unknown>).adapterType === "string"
+        ? ((bodyOverride as Record<string, unknown>).adapterType as string)
+        : null;
+      if (oldAdapterPin !== newAdapterPin) {
+        try {
+          await heartbeat.clearIssueTaskSessions(existing.companyId, existing.assigneeAgentId, existing.id);
+        } catch {
+          // best-effort: a session-store hiccup must not fail the issue write.
+        }
+      }
+    }
     const effectiveReviewPolicy = req.body.reviewPolicy === undefined
       ? existing.reviewPolicy
       : req.body.reviewPolicy;
