@@ -8,6 +8,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { InboxAgentPolicyControl } from "@/components/InboxAgentPolicyControl";
+import { PushNotificationsControl } from "@/components/PushNotificationsControl";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -273,6 +274,10 @@ export function ProfileSettings() {
 
         <Card className="rounded-(--rad-28) border-border/70 p-6">
           <InboxAgentPolicyControl companyId={selectedCompanyId} />
+        </Card>
+
+        <Card className="rounded-(--rad-28) border-border/70 p-6">
+          <PushNotificationsControl companyId={selectedCompanyId} />
         </Card>
       </section>
     </div>

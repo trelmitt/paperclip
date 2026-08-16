@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
 import { pushSubscriptionService } from "../services/push-subscriptions.js";
+import { getVapidPublicKey } from "../services/web-push.js";
 
 // The browser's PushSubscription.toJSON() shape, plus an optional userAgent for
 // display. Untrusted client input — every field is validated and length-capped.
@@ -34,6 +35,12 @@ function requireBoardUser(req: Request, res: Response) {
 export function pushSubscriptionRoutes(db: Db) {
   const router = Router();
   const svc = pushSubscriptionService(db);
+
+  // The VAPID public key the browser needs before it can pushManager.subscribe.
+  // Public by design; null tells the client web-push isn't set up on this instance.
+  router.get("/push/vapid-public-key", (_req, res) => {
+    res.json({ publicKey: getVapidPublicKey() });
+  });
 
   router.get("/companies/:companyId/push-subscriptions", async (req, res) => {
     const companyId = req.params.companyId as string;

@@ -101,6 +101,7 @@ import {
   issueWriteDenialResponse,
   type IssueWriteDenialCode,
   type IssueWriteDenialContext,
+  extractUserMentionIds,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -137,6 +138,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { assertIssueAssigneeAdapterOverrideAllowed as assertIssueAssigneeAdapterOverrideAllowedShared } from "../services/issue-assignee-adapter-override-gate.js";
+import { notifyUser } from "../services/web-push.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
   decideIssueReviewPathRecovery,
@@ -9909,6 +9911,18 @@ export function issueRoutes(
 
     const assigneeChanged =
       issue.assigneeAgentId !== existing.assigneeAgentId || issue.assigneeUserId !== existing.assigneeUserId;
+    // Web-push trigger (a): a human was newly assigned this issue. Fire-and-forget
+    // and self-skipping — never blocks the update, never pings you for your own move.
+    if (issue.assigneeUserId && issue.assigneeUserId !== existing.assigneeUserId) {
+      notifyUser(db, {
+        companyId: issue.companyId,
+        recipientUserId: issue.assigneeUserId,
+        actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        title: `Assigned: ${issue.identifier ?? issue.title}`,
+        body: issue.title,
+        url: `/issues/${issue.identifier ?? issue.id}`,
+      });
+    }
     const statusChangedFromBacklog =
       existing.status === "backlog" &&
       issue.status !== "backlog" &&
@@ -12024,6 +12038,21 @@ export function issueRoutes(
             wakeReason: "issue_comment_mentioned",
             source: "comment.mention",
           },
+        });
+      }
+
+      // Web-push trigger (b): a human @user-mentioned in this comment. The agent
+      // fan-out above wakes agents; this is the parallel human path. notifyUser is
+      // company-scoped and self-skipping, so a non-member/self id just no-ops.
+      const actorUserId = actor.actorType === "user" ? actor.actorId : null;
+      for (const mentionedUserId of extractUserMentionIds(req.body.body)) {
+        notifyUser(db, {
+          companyId: issue.companyId,
+          recipientUserId: mentionedUserId,
+          actorUserId,
+          title: `Mentioned in ${issue.identifier ?? issue.title}`,
+          body: req.body.body.slice(0, 140),
+          url: `/issues/${issue.identifier ?? issue.id}`,
         });
       }
 

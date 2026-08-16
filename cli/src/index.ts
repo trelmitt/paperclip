@@ -33,6 +33,7 @@ import { registerPluginCommands } from "./commands/client/plugin.js";
 import { registerClientAuthCommands } from "./commands/client/auth.js";
 import { registerConnectCommand } from "./commands/client/connect.js";
 import { registerShareCommand } from "./commands/share.js";
+import { registerPushCommands } from "./commands/push.js";
 import { registerTokenCommands } from "./commands/client/token.js";
 import { registerPromptCommands } from "./commands/client/prompt.js";
 import { registerRunCommands } from "./commands/client/run.js";
@@ -210,6 +211,7 @@ heartbeat
 registerContextCommands(program);
 registerConnectCommand(program);
 registerShareCommand(program);
+registerPushCommands(program);
 registerCompanyCommands(program);
 registerIssueCommands(program);
 registerAgentCommands(program);

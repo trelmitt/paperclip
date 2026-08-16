@@ -45,3 +45,56 @@ self.addEventListener("fetch", (event) => {
       })
   );
 });
+
+// --- Web push (backlog I) ---------------------------------------------------
+// The server sends { title, body, url }. Show it as a notification; clicking it
+// focuses an existing tab (or opens one) and navigates to the same-origin url.
+
+self.addEventListener("push", (event) => {
+  const data = { title: "Paperclip", body: "", url: "/" };
+  if (event.data) {
+    try {
+      Object.assign(data, event.data.json());
+    } catch {
+      data.body = event.data.text();
+    }
+  }
+  event.waitUntil(
+    self.registration.showNotification(data.title, {
+      body: data.body,
+      data: { url: typeof data.url === "string" ? data.url : "/" },
+      icon: "/android-chrome-192x192.png",
+      badge: "/favicon-32x32.png",
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const raw = (event.notification.data && event.notification.data.url) || "/";
+  // Only ever navigate to a path on our own origin — never follow an off-origin
+  // url that somehow landed in a payload.
+  let target = "/";
+  try {
+    const resolved = new URL(raw, self.location.origin);
+    if (resolved.origin === self.location.origin) {
+      target = resolved.pathname + resolved.search + resolved.hash;
+    }
+  } catch {
+    target = "/";
+  }
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ("focus" in client) {
+          client.focus();
+          if ("navigate" in client) {
+            return client.navigate(target).catch(() => undefined);
+          }
+          return undefined;
+        }
+      }
+      return self.clients.openWindow(target);
+    })
+  );
+});
