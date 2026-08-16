@@ -1897,7 +1897,7 @@ describe("IssueProperties", () => {
 
     // The trailing "clear" X was removed (ux-spec: one trailing-action style).
     // Clearing now happens by selecting the "Primary" model lane inside the picker.
-    const optionsTrigger = findRowTrigger(container, "Model");
+    const optionsTrigger = findRowTrigger(container, "Runner");
     expect(optionsTrigger).toBeTruthy();
     await act(async () => {
       optionsTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1913,6 +1913,98 @@ describe("IssueProperties", () => {
     });
 
     expect(onUpdate).toHaveBeenCalledWith({ assigneeAdapterOverrides: null });
+
+    act(() => root.unmount());
+  });
+
+  it("sets a per-issue runner override when a different runner is selected", async () => {
+    const onUpdate = vi.fn();
+    mockAgentsApi.list.mockResolvedValue([
+      {
+        id: "agent-1",
+        name: "Senior Product Engineer",
+        role: "engineer",
+        title: null,
+        status: "active",
+        adapterType: "codex_local",
+        icon: null,
+      },
+    ]);
+
+    const root = renderProperties(container, {
+      issue: createIssue({
+        assigneeAgentId: "agent-1",
+        assigneeAdapterOverrides: null,
+      }),
+      childIssues: [],
+      onUpdate,
+    });
+    await flush();
+    await flush();
+
+    // The runner picker is offered even at the assignee default so the operator can
+    // reroute THIS issue onto a different provider (G: per-issue runner override).
+    let runnerOption: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      runnerOption = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Claude Code");
+      expect(runnerOption).not.toBeUndefined();
+    });
+
+    await act(async () => {
+      runnerOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({
+      assigneeAdapterOverrides: { adapterType: "claude_local" },
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("keeps the runner override when switching into the custom model lane", async () => {
+    const onUpdate = vi.fn();
+    mockAgentsApi.list.mockResolvedValue([
+      {
+        id: "agent-1",
+        name: "Senior Product Engineer",
+        role: "engineer",
+        title: null,
+        status: "active",
+        adapterType: "claude_local",
+        icon: null,
+      },
+    ]);
+
+    const root = renderProperties(container, {
+      issue: createIssue({
+        assigneeAgentId: "agent-1",
+        // A runner override is active but no model config yet (lane derives as "primary").
+        assigneeAdapterOverrides: { adapterType: "codex_local" },
+      }),
+      childIssues: [],
+      onUpdate,
+    });
+    await flush();
+    await flush();
+
+    // Regression: clicking "Override" must attach an adapterConfig so the lane resolves to custom
+    // (not snap back to primary), AND must not drop the runner. Before the fix, an active runner
+    // made the lane switch a silent no-op.
+    let overrideLaneButton: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      overrideLaneButton = Array.from(container.querySelectorAll<HTMLButtonElement>('button[role="radio"]'))
+        .find((button) => button.textContent?.trim() === "Override");
+      expect(overrideLaneButton).not.toBeUndefined();
+    });
+
+    await act(async () => {
+      overrideLaneButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({
+      assigneeAdapterOverrides: { adapterType: "codex_local", adapterConfig: {} },
+    });
 
     act(() => root.unmount());
   });

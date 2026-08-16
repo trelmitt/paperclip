@@ -22,6 +22,7 @@ import { useSidebar } from "../../context/SidebarContext";
 import { queryKeys } from "../../lib/queryKeys";
 import { buildCompanyUserInlineOptions, buildCompanyUserLabelMap, buildCompanyUserProfileMap, isAgentTaskTarget } from "../../lib/company-members";
 import { ISSUE_OVERRIDE_ADAPTER_TYPES, type IssueModelLane } from "../../lib/issue-assignee-overrides";
+import { getAdapterLabel } from "../../adapters/adapter-display-registry";
 import { useProjectOrder } from "../../hooks/useProjectOrder";
 import {
   getRecentAssigneeIds,
@@ -529,40 +530,52 @@ export function IssueProperties({
     : null;
   const assigneeAdapterType = assignee?.adapterType ?? null;
   const assigneeAdapterOverrides = issue.assigneeAdapterOverrides ?? null;
-  const showAssigneeAdapterOptions = assigneeAdapterOverrides !== null;
+  // G: a per-issue runner override reroutes THIS issue onto a different adapter than the
+  // assignee's own default. The model machinery below keys off the EFFECTIVE adapter
+  // (override runner ?? assignee's own) so the model list + lanes match the provider that
+  // will actually run the issue.
+  const assigneeOverrideRunner =
+    typeof assigneeAdapterOverrides?.adapterType === "string" ? assigneeAdapterOverrides.adapterType : null;
+  const effectiveOverrideAdapterType = assigneeOverrideRunner ?? assigneeAdapterType;
+  // Show the runner/model picker for any agent assignee with an adapter (so an operator can
+  // switch the runner even from the default state), or whenever an override already exists.
+  const showAssigneeAdapterOptions = Boolean(assigneeAdapterType) || assigneeAdapterOverrides !== null;
   const supportsAssigneeOverrides = Boolean(
-    assigneeAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(assigneeAdapterType),
+    effectiveOverrideAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(effectiveOverrideAdapterType),
   );
   const assigneeSupportsCheapLane = Boolean(
     supportsAssigneeOverrides
-      && (assigneeAdapterType === "claude_local"
-        || assigneeAdapterType === "codex_local"
-        || assigneeAdapterType === "opencode_local"),
+      && (effectiveOverrideAdapterType === "claude_local"
+        || effectiveOverrideAdapterType === "codex_local"
+        || effectiveOverrideAdapterType === "opencode_local"),
   );
   const assigneeOverrideLane = overrideLane(assigneeAdapterOverrides);
   const assigneeOverrideAdapterConfig = asRecord(assigneeAdapterOverrides?.adapterConfig);
   const assigneeOverrideModel =
     typeof assigneeOverrideAdapterConfig.model === "string" ? assigneeOverrideAdapterConfig.model : "";
   const assigneeOverrideThinkingEffort = thinkingEffortValueFor(
-    assigneeAdapterType,
+    effectiveOverrideAdapterType,
     assigneeOverrideAdapterConfig,
   );
-  const assigneeOverrideChrome = assigneeAdapterType === "claude_local"
+  const assigneeOverrideChrome = effectiveOverrideAdapterType === "claude_local"
     && assigneeOverrideAdapterConfig.chrome === true;
+  // Lazy: only fetch model/profile lists once the picker is opened (or an override already
+  // exists), so relaxing the render gate does not fire these for every assigned issue.
+  const assigneeOverridesQueryEnabled = assigneeOptionsOpen || assigneeAdapterOverrides !== null;
   const { data: assigneeAdapterModels } = useQuery({
     queryKey:
-      companyId && assigneeAdapterType
-        ? queryKeys.agents.adapterModels(companyId, assigneeAdapterType)
-        : ["agents", "none", "adapter-models", assigneeAdapterType ?? "none"],
-    queryFn: () => agentsApi.adapterModels(companyId!, assigneeAdapterType!),
-    enabled: Boolean(companyId) && showAssigneeAdapterOptions && supportsAssigneeOverrides,
+      companyId && effectiveOverrideAdapterType
+        ? queryKeys.agents.adapterModels(companyId, effectiveOverrideAdapterType)
+        : ["agents", "none", "adapter-models", effectiveOverrideAdapterType ?? "none"],
+    queryFn: () => agentsApi.adapterModels(companyId!, effectiveOverrideAdapterType!),
+    enabled: Boolean(companyId) && assigneeOverridesQueryEnabled && supportsAssigneeOverrides,
   });
   const { data: assigneeCheapProfiles } = useQuery({
-    queryKey: companyId && assigneeAdapterType
-      ? queryKeys.agents.adapterModelProfiles(companyId, assigneeAdapterType)
-      : ["agents", "none", "adapter-model-profiles", assigneeAdapterType ?? "none"],
-    queryFn: () => agentsApi.adapterModelProfiles(companyId!, assigneeAdapterType!),
-    enabled: Boolean(companyId) && showAssigneeAdapterOptions && assigneeSupportsCheapLane,
+    queryKey: companyId && effectiveOverrideAdapterType
+      ? queryKeys.agents.adapterModelProfiles(companyId, effectiveOverrideAdapterType)
+      : ["agents", "none", "adapter-model-profiles", effectiveOverrideAdapterType ?? "none"],
+    queryFn: () => agentsApi.adapterModelProfiles(companyId!, effectiveOverrideAdapterType!),
+    enabled: Boolean(companyId) && assigneeOverridesQueryEnabled && assigneeSupportsCheapLane,
   });
   const assigneeCheapProfile = useMemo(
     () => (assigneeCheapProfiles ?? []).find((profile) => profile.key === "cheap") ?? null,
@@ -590,6 +603,7 @@ export function IssueProperties({
   const buildAssigneeOverrideWithConfig = (adapterConfig: Record<string, unknown>) => {
     const nextConfig = compactRecord(adapterConfig);
     const next = compactRecord({
+      adapterType: assigneeOverrideRunner ?? undefined,
       useProjectWorkspace: assigneeAdapterOverrides?.useProjectWorkspace,
       ...(Object.keys(nextConfig).length > 0 ? { adapterConfig: nextConfig } : {}),
     });
@@ -610,143 +624,230 @@ export function IssueProperties({
     delete nextConfig.effort;
     delete nextConfig.variant;
     if (nextValue) {
-      nextConfig[thinkingEffortKeyFor(assigneeAdapterType)] = nextValue;
+      nextConfig[thinkingEffortKeyFor(effectiveOverrideAdapterType)] = nextValue;
     }
     updateAssigneeAdapterOverrides(buildAssigneeOverrideWithConfig(nextConfig));
   };
   const setAssigneeOverrideLane = (lane: IssueModelLane) => {
     if (lane === "primary") {
-      updateAssigneeAdapterOverrides(null);
+      // Keep any runner override (adapter-agnostic); drop the model config.
+      const nextPrimary = compactRecord({
+        adapterType: assigneeOverrideRunner ?? undefined,
+        useProjectWorkspace: assigneeAdapterOverrides?.useProjectWorkspace,
+      });
+      updateAssigneeAdapterOverrides(Object.keys(nextPrimary).length > 0 ? nextPrimary : null);
       return;
     }
     if (lane === "cheap") {
       updateAssigneeAdapterOverrides(
         compactRecord({
+          adapterType: assigneeOverrideRunner ?? undefined,
           useProjectWorkspace: assigneeAdapterOverrides?.useProjectWorkspace,
           modelProfile: "cheap",
         }),
       );
       return;
     }
-    updateAssigneeAdapterOverrides(buildAssigneeOverrideWithConfig(assigneeOverrideAdapterConfig) ?? { adapterConfig: {} });
+    // Entering the custom lane must ALWAYS leave an adapterConfig key so overrideLane() reports
+    // "custom" — otherwise the lane snaps back to primary and the model/effort/chrome editors never
+    // mount. buildAssigneeOverrideWithConfig() drops an empty adapterConfig, and a runner (or
+    // workspace) override makes its result non-null, which would bypass the fallback. Write the
+    // override directly instead, mirroring the primary/cheap branches. compactRecord keeps the
+    // (possibly empty) adapterConfig object since it only strips undefined.
+    updateAssigneeAdapterOverrides(
+      compactRecord({
+        adapterType: assigneeOverrideRunner ?? undefined,
+        useProjectWorkspace: assigneeAdapterOverrides?.useProjectWorkspace,
+        adapterConfig: assigneeOverrideAdapterConfig,
+      }),
+    );
+  };
+  // G: the Runner selector — pick which adapter/provider runs THIS issue. Selecting a
+  // different runner keeps the adapter-agnostic model lane (modelProfile) but drops any
+  // adapter-specific adapterConfig (model/effort keys don't carry across providers).
+  const runnerOptions = useMemo<InlineEntityOption[]>(
+    () =>
+      [...ISSUE_OVERRIDE_ADAPTER_TYPES].map((type) => ({
+        id: type,
+        label: type === assigneeAdapterType ? `${getAdapterLabel(type)} (assignee default)` : getAdapterLabel(type),
+        searchText: `${getAdapterLabel(type)} ${type}`,
+      })),
+    [assigneeAdapterType],
+  );
+  const assigneeDefaultRunnerLabel = assigneeAdapterType
+    ? `${getAdapterLabel(assigneeAdapterType)} (assignee default)`
+    : "Assignee default";
+  const setAssigneeRunner = (nextAdapterType: string | null) => {
+    if (!nextAdapterType || nextAdapterType === assigneeAdapterType) {
+      // Clear the runner override; keep any model-lane override on the assignee's own adapter.
+      const rest = compactRecord({
+        useProjectWorkspace: assigneeAdapterOverrides?.useProjectWorkspace,
+        modelProfile: assigneeAdapterOverrides?.modelProfile,
+        ...(assigneeAdapterOverrides?.adapterConfig ? { adapterConfig: assigneeAdapterOverrides.adapterConfig } : {}),
+      });
+      updateAssigneeAdapterOverrides(Object.keys(rest).length > 0 ? rest : null);
+      return;
+    }
+    updateAssigneeAdapterOverrides(
+      compactRecord({
+        adapterType: nextAdapterType,
+        useProjectWorkspace: assigneeAdapterOverrides?.useProjectWorkspace,
+        modelProfile: assigneeAdapterOverrides?.modelProfile,
+      }),
+    );
   };
   const assigneeOptionsTrigger = (() => {
-    if (assigneeOverrideLane === "cheap") {
-      return <span className="text-sm">Cheap model</span>;
-    }
-    if (assigneeOverrideLane === "custom") {
-      const details = [
-        assigneeOverrideModel,
-        assigneeOverrideThinkingEffort,
-        assigneeOverrideChrome ? "Chrome" : "",
-      ].filter(Boolean);
-      const summary = details.length > 0 ? `Override · ${details.join(" · ")}` : "Override · adapter options";
+    const runnerLabel = assigneeOverrideRunner ? getAdapterLabel(assigneeOverrideRunner) : null;
+    const laneText =
+      assigneeOverrideLane === "cheap"
+        ? "Cheap model"
+        : assigneeOverrideLane === "custom"
+          ? (() => {
+              const details = [
+                assigneeOverrideModel,
+                assigneeOverrideThinkingEffort,
+                assigneeOverrideChrome ? "Chrome" : "",
+              ].filter(Boolean);
+              return details.length > 0 ? `Override · ${details.join(" · ")}` : "Override · adapter options";
+            })()
+          : "Primary model";
+    if (runnerLabel) {
       return (
         <span
           className="min-w-0 truncate text-sm"
-          title={`Task-level model override — replaces the agent's primary model for this issue.${details.length > 0 ? ` (${details.join(" · ")})` : ""}`}
+          title={`Runs on ${runnerLabel} for this issue — ${laneText}`}
         >
-          {summary}
+          {runnerLabel} · {laneText}
         </span>
       );
     }
-    return <span className="text-sm text-muted-foreground">Primary model</span>;
+    return (
+      <span
+        className={cn("min-w-0 truncate text-sm", assigneeOverrideLane === "primary" && "text-muted-foreground")}
+      >
+        {laneText}
+      </span>
+    );
   })();
-  const assigneeOptionsContent = supportsAssigneeOverrides ? (
+  const assigneeOptionsContent = (
     <div className="w-full space-y-3 p-2">
       <div className="space-y-1.5">
-        <div className="text-xs text-muted-foreground">Model lane</div>
-        <div className="flex w-full overflow-hidden rounded-md border border-border" role="radiogroup" aria-label="Model lane">
-          {(["primary", ...(assigneeSupportsCheapLane ? (["cheap"] as const) : ([] as const)), "custom"] as const).map((lane) => (
-            <button
-              key={lane}
-              type="button"
-              role="radio"
-              aria-checked={assigneeOverrideLane === lane}
-              className={cn(
-                "flex-1 px-2 py-1 text-xs capitalize transition-colors hover:bg-accent/40",
-                assigneeOverrideLane === lane && "bg-accent text-foreground",
-              )}
-              onClick={() => setAssigneeOverrideLane(lane)}
-            >
-              {lane === "primary" ? "Primary" : lane === "cheap" ? "Cheap" : "Override"}
-            </button>
-          ))}
-        </div>
-        {assigneeOverrideLane === "cheap" ? (
-          <p className="text-xs text-muted-foreground">
-            Sends <code>modelProfile: "cheap"</code>{" "}
-            {assigneeCheapProfile?.adapterConfig && typeof (assigneeCheapProfile.adapterConfig as Record<string, unknown>).model === "string"
-              ? <>· adapter default <code>{String((assigneeCheapProfile.adapterConfig as Record<string, unknown>).model)}</code></>
-              : assigneeCheapProfile
-                ? <>· uses the agent&apos;s configured cheap profile</>
-                : <>· falls back to the primary model if no cheap profile is configured</>}
-          </p>
-        ) : null}
-        {assigneeOverrideLane === "custom" ? (
-          <p className="text-xs text-muted-foreground">
-            Task-level model override — replaces the agent&apos;s primary model for this issue.
-          </p>
-        ) : null}
+        <div className="text-xs text-muted-foreground">Runner</div>
+        <InlineEntitySelector
+          value={assigneeOverrideRunner ?? ""}
+          options={runnerOptions}
+          placeholder={assigneeDefaultRunnerLabel}
+          disablePortal
+          noneLabel={assigneeDefaultRunnerLabel}
+          searchPlaceholder="Search runners..."
+          emptyMessage="No runners found."
+          onChange={(next) => setAssigneeRunner(next || null)}
+        />
+        <p className="text-xs text-muted-foreground">
+          {assigneeOverrideRunner
+            ? "Runs this issue on the selected provider instead of the assignee's default."
+            : "Runs on the assignee's own adapter. Pick another to run this issue on a different provider."}
+        </p>
       </div>
-      {assigneeOverrideLane === "custom" ? (
+      {supportsAssigneeOverrides ? (
         <>
           <div className="space-y-1.5">
-            <div className="text-xs text-muted-foreground">Model</div>
-            <InlineEntitySelector
-              value={assigneeOverrideModel}
-              options={modelOverrideOptions}
-              placeholder="Default model"
-              disablePortal
-              noneLabel="Default model"
-              searchPlaceholder="Search models..."
-              emptyMessage="No models found."
-              onChange={(model) => updateAssigneeOverrideConfig({ model: model || undefined })}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <div className="text-xs text-muted-foreground">Thinking effort</div>
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {thinkingEffortOptionsFor(assigneeAdapterType).map((option) => (
+            <div className="text-xs text-muted-foreground">Model lane</div>
+            <div className="flex w-full overflow-hidden rounded-md border border-border" role="radiogroup" aria-label="Model lane">
+              {(["primary", ...(assigneeSupportsCheapLane ? (["cheap"] as const) : ([] as const)), "custom"] as const).map((lane) => (
                 <button
-                  key={option.value || "default"}
+                  key={lane}
+                  type="button"
+                  role="radio"
+                  aria-checked={assigneeOverrideLane === lane}
                   className={cn(
-                    "px-2 py-1 rounded-md text-xs border border-border hover:bg-accent/50 transition-colors",
-                    assigneeOverrideThinkingEffort === option.value && "bg-accent",
+                    "flex-1 px-2 py-1 text-xs capitalize transition-colors hover:bg-accent/40",
+                    assigneeOverrideLane === lane && "bg-accent text-foreground",
                   )}
-                  onClick={() => updateAssigneeOverrideThinkingEffort(option.value)}
+                  onClick={() => setAssigneeOverrideLane(lane)}
                 >
-                  {option.label}
+                  {lane === "primary" ? "Primary" : lane === "cheap" ? "Cheap" : "Override"}
                 </button>
               ))}
             </div>
+            {assigneeOverrideLane === "cheap" ? (
+              <p className="text-xs text-muted-foreground">
+                Sends <code>modelProfile: "cheap"</code>{" "}
+                {assigneeCheapProfile?.adapterConfig && typeof (assigneeCheapProfile.adapterConfig as Record<string, unknown>).model === "string"
+                  ? <>· adapter default <code>{String((assigneeCheapProfile.adapterConfig as Record<string, unknown>).model)}</code></>
+                  : assigneeCheapProfile
+                    ? <>· uses the agent&apos;s configured cheap profile</>
+                    : <>· falls back to the primary model if no cheap profile is configured</>}
+              </p>
+            ) : null}
+            {assigneeOverrideLane === "custom" ? (
+              <p className="text-xs text-muted-foreground">
+                Task-level model override — replaces the agent&apos;s primary model for this issue.
+              </p>
+            ) : null}
           </div>
-          {assigneeAdapterType === "claude_local" ? (
-            <div className="flex items-center justify-between rounded-md border border-border px-2 py-1.5">
-              <div className="text-xs text-muted-foreground">Enable Chrome (--chrome)</div>
-              <ToggleSwitch
-                checked={assigneeOverrideChrome}
-                onCheckedChange={(next) => updateAssigneeOverrideConfig({ chrome: next ? true : undefined })}
-              />
-            </div>
+          {assigneeOverrideLane === "custom" ? (
+            <>
+              <div className="space-y-1.5">
+                <div className="text-xs text-muted-foreground">Model</div>
+                <InlineEntitySelector
+                  value={assigneeOverrideModel}
+                  options={modelOverrideOptions}
+                  placeholder="Default model"
+                  disablePortal
+                  noneLabel="Default model"
+                  searchPlaceholder="Search models..."
+                  emptyMessage="No models found."
+                  onChange={(model) => updateAssigneeOverrideConfig({ model: model || undefined })}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="text-xs text-muted-foreground">Thinking effort</div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {thinkingEffortOptionsFor(effectiveOverrideAdapterType).map((option) => (
+                    <button
+                      key={option.value || "default"}
+                      className={cn(
+                        "px-2 py-1 rounded-md text-xs border border-border hover:bg-accent/50 transition-colors",
+                        assigneeOverrideThinkingEffort === option.value && "bg-accent",
+                      )}
+                      onClick={() => updateAssigneeOverrideThinkingEffort(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {effectiveOverrideAdapterType === "claude_local" ? (
+                <div className="flex items-center justify-between rounded-md border border-border px-2 py-1.5">
+                  <div className="text-xs text-muted-foreground">Enable Chrome (--chrome)</div>
+                  <ToggleSwitch
+                    checked={assigneeOverrideChrome}
+                    onCheckedChange={(next) => updateAssigneeOverrideConfig({ chrome: next ? true : undefined })}
+                  />
+                </div>
+              ) : null}
+            </>
           ) : null}
         </>
-      ) : null}
-    </div>
-  ) : (
-    <div className="w-full space-y-2 p-2">
-      <p className="text-xs text-muted-foreground">
-        {assignee
-          ? "This assignee's adapter does not expose editable task overrides."
-          : "Select a compatible assignee agent to edit these overrides."}
-      </p>
-      <button
-        type="button"
-        className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
-        onClick={() => updateAssigneeAdapterOverrides(null)}
-      >
-        Clear adapter options
-      </button>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-xs text-muted-foreground">
+            {assignee
+              ? "This runner does not expose editable model options; it runs on its default model."
+              : "Select a compatible assignee agent to edit model options."}
+          </p>
+          {assigneeAdapterOverrides !== null ? (
+            <button
+              type="button"
+              className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+              onClick={() => updateAssigneeAdapterOverrides(null)}
+            >
+              Clear adapter options
+            </button>
+          ) : null}
+        </div>
+      )}
     </div>
   );
   const reviewerValues = stageParticipantValues(issue.executionPolicy, "review");
@@ -2125,7 +2226,7 @@ export function IssueProperties({
         {showAssigneeAdapterOptions ? (
           <PropertyPicker
             inline={inline}
-            label="Model"
+            label="Runner"
             open={assigneeOptionsOpen}
             onOpenChange={setAssigneeOptionsOpen}
             triggerContent={assigneeOptionsTrigger}
