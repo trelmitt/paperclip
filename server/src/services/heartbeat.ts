@@ -14191,6 +14191,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: agent.companyId,
         issuePriority: issueContext?.priority,
         issueWorkMode: issueContext?.workMode,
+        hasIssueWork: issueContext != null,
       })
     ) {
       context.modelProfile = ESCALATION_RECOVERY_MODEL_PROFILE_KEY;

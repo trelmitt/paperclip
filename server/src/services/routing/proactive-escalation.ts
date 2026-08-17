@@ -72,8 +72,13 @@ export function shouldProactivelyEscalate(input: {
   companyId: string | null | undefined;
   issuePriority?: string | null;
   issueWorkMode?: string | null;
+  hasIssueWork?: boolean;
 }): boolean {
   if (input.issueWorkMode === "planning") return false;
+  // Only real issue work escalates. Idle heartbeat "seek work" wakes carry no issue -- escalating
+  // them would load the slow dense 27B for trivial "what should I do?" seek calls and thrash it
+  // in/out against the resident coder every idle cycle. The strong lane is for WORK, not seeks.
+  if (!input.hasIssueWork) return false;
   if (agentOptsIntoProactiveEscalation(input.agentRuntimeConfig)) return true;
   if (input.companyId && HIGH_VALUE_COMPANY_IDS.has(input.companyId)) return true;
   if (ESCALATE_CRITICAL_PRIORITY && input.issuePriority === "critical") return true;

@@ -17,6 +17,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         companyId: "c1",
         issuePriority: "medium",
         issueWorkMode: "execution",
+        hasIssueWork: true,
       }),
     ).toBe(true);
   });
@@ -29,6 +30,22 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         companyId: "c1",
         issuePriority: "critical",
         issueWorkMode: "planning",
+        hasIssueWork: true,
+      }),
+    ).toBe(false);
+  });
+
+  // The idle-seek guard: an opted-in agent whose wake carries NO issue (a heartbeat "seek work"
+  // cycle) must NOT escalate -- the strong lane is for real work, not idle "what should I do?"
+  // calls that would thrash the dense 27B in/out against the coder every cycle.
+  it("never escalates an idle no-issue seek wake, even for an opted-in agent", () => {
+    expect(
+      shouldProactivelyEscalate({
+        agentRuntimeConfig: OPTED_IN,
+        companyId: "c1",
+        issuePriority: undefined,
+        issueWorkMode: undefined,
+        hasIssueWork: false,
       }),
     ).toBe(false);
   });
@@ -40,6 +57,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         companyId: "c1",
         issuePriority: "medium",
         issueWorkMode: "execution",
+        hasIssueWork: true,
       }),
     ).toBe(false);
   });
@@ -51,6 +69,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         companyId: "c1",
         issuePriority: "critical",
         issueWorkMode: "execution",
+        hasIssueWork: true,
       }),
     ).toBe(true);
   });
@@ -62,6 +81,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         companyId: "c1",
         issuePriority: "critical",
         issueWorkMode: "planning",
+        hasIssueWork: true,
       }),
     ).toBe(false);
   });
@@ -75,6 +95,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         companyId: "c1",
         issuePriority: "low",
         issueWorkMode: null,
+        hasIssueWork: true,
       }),
     ).toBe(true);
   });
@@ -87,6 +108,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
           companyId: null,
           issuePriority: "low",
           issueWorkMode: null,
+          hasIssueWork: true,
         }),
       ).toBe(false);
     }
