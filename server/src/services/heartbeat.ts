@@ -233,9 +233,11 @@ import {
   buildWorkspaceValidationRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
 import {
+  ESCALATION_RECOVERY_MODEL_PROFILE_KEY,
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
+import { shouldProactivelyEscalate } from "./routing/proactive-escalation.js";
 import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
@@ -14174,6 +14176,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
         "Failed to resolve adapter model profiles; falling back to primary adapter config",
       );
+    }
+    // Proactive (pre-failure) high-value routing: stamp modelProfile:"escalate" onto this wake's
+    // context so designated high-value / critical (non-planning) work routes to the strong-model
+    // :8010 lane -- but ONLY when the wake carries no profile yet (don't clobber a recovery
+    // 'cheap'/'escalate' wake) AND there is no sticky issue override (it wins anyway, and a sticky
+    // escalate would disable the status_only guard). Context-carried => self-clears next wake,
+    // never touches the persistent assigneeAdapterOverrides column. See routing/proactive-escalation.
+    if (
+      readContextModelProfile(context) === null &&
+      !issueAssigneeOverrides?.modelProfile &&
+      shouldProactivelyEscalate({
+        agentRuntimeConfig: agent.runtimeConfig,
+        companyId: agent.companyId,
+        issuePriority: issueContext?.priority,
+        issueWorkMode: issueContext?.workMode,
+      })
+    ) {
+      context.modelProfile = ESCALATION_RECOVERY_MODEL_PROFILE_KEY;
     }
     const modelProfileApplication = resolveModelProfileApplication({
       adapterModelProfiles,
