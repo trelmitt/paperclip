@@ -62,7 +62,10 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
     ).toBe(false);
   });
 
-  it("escalates critical-priority non-planning work by default (no per-agent opt-in needed)", () => {
+  // DISABLED 2026-08-17: critical-priority no longer auto-escalates. Escalating a critical
+  // issue's WHOLE run to the ~36 tok/s 27B times out (1800s cap); critical work stays on the
+  // fast model and delegates hard subtasks to the 27B. ESCALATE_CRITICAL_PRIORITY = false.
+  it("does NOT auto-escalate critical-priority work (whole-run escalation disabled)", () => {
     expect(
       shouldProactivelyEscalate({
         agentRuntimeConfig: {},
@@ -71,7 +74,7 @@ describe("shouldProactivelyEscalate (proactive high-value routing)", () => {
         issueWorkMode: "execution",
         hasIssueWork: true,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("does not escalate critical-priority PLANNING work (planning guard beats the critical gate)", () => {

@@ -1139,9 +1139,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     extraContext?: Record<string, unknown>;
     attemptCount?: number;
   }) {
-    // >=2 failed attempts -> route this GENUINE re-attempt to the strong model. withRecoveryEscalationHint
-    // stamps modelProfile:"escalate" AFTER the normal_model scrub and only on the per-wake payload/context
-    // (never the issue override column). See its docstring for the two invariants it enforces.
+    // DISABLED 2026-08-17: recovery auto-escalation to the strong model is OFF. Escalating a failed
+    // retry's WHOLE run to the dense 27B times out (a full agent session at ~36 tok/s exceeds the
+    // 1800s run cap -- measured: the only escalate run in history timed out). Retries stay on the
+    // fast fleet model; route hard SUBTASKS to the 27B via the opencode `hard-task` subagent instead.
+    // Flip the flag to restore >=2-attempt escalation (only if the 27B whole-session speed is solved).
+    // See vault: "Dense 27B is a bounded-call engine not a whole-session engine (2026-08-17)".
+    const RECOVERY_ESCALATION_TO_STRONG_MODEL_ENABLED = false;
+    const recoveryEscalationAttemptCount = RECOVERY_ESCALATION_TO_STRONG_MODEL_ENABLED
+      ? input.attemptCount
+      : 0;
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -1152,7 +1159,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
           ...(input.extraContext ?? {}),
         }, "normal_model"),
-        input.attemptCount,
+        recoveryEscalationAttemptCount,
       ),
       requestedByActorType: "system",
       requestedByActorId: null,
@@ -1166,7 +1173,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
           ...(input.extraContext ?? {}),
         }, "normal_model"),
-        input.attemptCount,
+        recoveryEscalationAttemptCount,
       ),
     });
 

@@ -27,18 +27,22 @@ import { ESCALATION_RECOVERY_MODEL_PROFILE_KEY } from "../recovery/model-profile
  * rollout. Prefer the per-agent `runtimeConfig.proactiveModelProfile` flag for
  * finer-grained control.
  */
-export const HIGH_VALUE_COMPANY_IDS: ReadonlySet<string> = new Set<string>([
-  "54f418d2-d1ef-400f-9f09-684246293de1", // Twenty Four — blanket proactive escalation of non-planning work
-]);
+// DISABLED 2026-08-17: whole-run escalation to the dense 27B TIMES OUT. A full agent
+// heartbeat session (40-93K-token prefills, multi-turn) at ~36 tok/s exceeds the 1800s run
+// cap (measured: the one escalate run timed out; a bounded opencode->27B call completes in
+// ~75s). The 27B is a BOUNDED-CALL engine -- route hard SUBTASKS to it via the opencode
+// `hard-task` subagent, not whole runs. Keep this set EMPTY. See the vault finding
+// "Dense 27B is a bounded-call engine not a whole-session engine (2026-08-17)".
+export const HIGH_VALUE_COMPANY_IDS: ReadonlySet<string> = new Set<string>([]);
 
 /**
- * When true, any `critical`-priority non-planning issue proactively escalates,
- * regardless of per-agent config — "high-value WORK gets the strong model." Bounded
- * (critical issues are rare) and safe (the :8010 cap + downgrade valve). Flip to
- * false to make proactive escalation strictly opt-in via the per-agent flag /
- * company allowlist.
+ * DISABLED 2026-08-17 (false): escalating a critical issue's WHOLE run to the dense 27B
+ * times out the same way (a full agent session is too heavy for ~36 tok/s within the 1800s
+ * cap). Critical work stays on the fast fleet model and delegates hard SUBTASKS to the 27B
+ * via the opencode `hard-task` subagent. Re-enable only if the 27B whole-session speed
+ * problem is solved (faster quant / much longer escalated-run timeout).
  */
-export const ESCALATE_CRITICAL_PRIORITY = true;
+export const ESCALATE_CRITICAL_PRIORITY = false;
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (typeof value === "string") {
