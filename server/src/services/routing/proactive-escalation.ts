@@ -27,7 +27,9 @@ import { ESCALATION_RECOVERY_MODEL_PROFILE_KEY } from "../recovery/model-profile
  * rollout. Prefer the per-agent `runtimeConfig.proactiveModelProfile` flag for
  * finer-grained control.
  */
-export const HIGH_VALUE_COMPANY_IDS: ReadonlySet<string> = new Set<string>([]);
+export const HIGH_VALUE_COMPANY_IDS: ReadonlySet<string> = new Set<string>([
+  "54f418d2-d1ef-400f-9f09-684246293de1", // Twenty Four — blanket proactive escalation of non-planning work
+]);
 
 /**
  * When true, any `critical`-priority non-planning issue proactively escalates,
