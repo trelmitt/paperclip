@@ -2010,6 +2010,84 @@ export interface PluginExecutionClient {
 }
 
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Safety (env leak detection, guard evaluation)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of a guard evaluation through `ctx.safety.checkGuard()`.
+ *
+ * @see workspaceSafety service in server/src/services/workspace-safety.ts
+ */
+export interface PluginSafetyGuardCheckResult {
+  /** Whether any guard rules flagged the environment. */
+  safe: boolean;
+  /** Total number of guard rules evaluated. */
+  guardsChecked: number;
+  /** Guard issues found, keyed by environment variable name. */
+  issues: Array<{ key: string; description: string }>;
+}
+
+/**
+ * Result of environment leak detection through `ctx.safety.detectEnvLeaks()`.
+ *
+ * Scans the worker's environment for credential-like values and suspicious
+ * variable names.
+ *
+ * @see workspaceSafety service in server/src/services/workspace-safety.ts
+ */
+export interface PluginSafetyLeakDetectionResult {
+  /** Whether any leaks were detected. */
+  safe: boolean;
+  /** Whether scanning was actually performed. */
+  scanned: boolean;
+  /** Number of leak detection rules applied. */
+  rulesApplied: number;
+  /** Keys with suspected credential-like values. */
+  leakages: Array<{ key: string; type: string }>;
+}
+
+/**
+ * `ctx.safety` — evaluate safety guard rules and detect environment variable leaks.
+ *
+ * Plugin workers use this client to ask the host to evaluate their current
+ * environment snapshot against guard rules and detect leaked credentials.
+ * The actual evaluation runs on the host side (workspaceSafety service).
+ *
+ * @example
+ * ```ts
+ * // Check env against guard rules
+ * const guards = await ctx.safety.checkGuard();
+ * if (!guards.safe) {
+ *   for (const issue of guards.issues) {
+ *     ctx.logger.warn(`Guard issue: ${issue.key} — ${issue.description}`);
+ *   }
+ * }
+ * ```
+ *
+ * @see PLUGIN_SPEC.md §14 — SDK Surface
+ */
+export interface PluginSafetyClient {
+  /**
+   * Evaluate safety guard rules against the worker's current environment.
+   * Checks env var names against patterns for cloud creds, API keys, secrets,
+   * passwords, private keys, auth tokens, and connection strings.
+   *
+   * Requires 'workspace.safety' capability.
+   */
+  checkGuard(): Promise<PluginSafetyGuardCheckResult>;
+
+  /**
+   * Detect credential-like values in environment variable entries.
+   * Uses pattern matching on key names and values to identify potential
+   * credential leaks (OpenAI keys, generic secrets, high-entropy values).
+   *
+   * Requires 'workspace.safety' capability.
+   */
+  detectEnvLeaks(): Promise<PluginSafetyLeakDetectionResult>;
+}
 // Full plugin context
 // ---------------------------------------------------------------------------
 
@@ -2139,6 +2217,9 @@ export interface PluginContext {
   /** Tracer for provider spans. The default is a no-op; the host records a span
    * only when tracing is on and an active host trace context is present. */
   tracer: PluginTracer;
+
+  /** Safety guard evaluation and environment leak detection. Requires 'workspace.safety' capability. */
+  safety: PluginSafetyClient;
 }
 
 // ---------------------------------------------------------------------------

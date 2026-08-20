@@ -74,6 +74,8 @@ import type {
   PluginAuthorizationDecisionResult,
   PluginAuthorizationPolicyRecord,
   PluginAuthorizationPolicySummary,
+  PluginSafetyGuardCheckResult,
+  PluginSafetyLeakDetectionResult,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1870,6 +1872,10 @@ export interface WorkerToHostMethods {
     },
     result: PluginAuthorizationAuditEntry[],
   ];
+
+  // Safety
+  "safety.checkGuard": [params: { guardKey: string }, result: PluginSafetyGuardCheckResult];
+  "safety.detectEnvLeaks": [params: Record<string, never>, result: PluginSafetyLeakDetectionResult];
 }
 
 /** Union of all worker→host method names. */

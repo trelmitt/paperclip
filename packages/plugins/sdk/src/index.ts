@@ -285,6 +285,9 @@ export type {
   PluginTracer,
   PluginSpan,
   SafetyGuardDeclaration,
+  PluginSafetyClient,
+  PluginSafetyGuardCheckResult,
+  PluginSafetyLeakDetectionResult,
 } from "./types.js";
 
 export {
@@ -389,6 +392,16 @@ export type {
   PluginBridgeErrorCode,
 } from "./types.js";
 
+
+
+// ---------------------------------------------------------------------------
+// Command discovery (workspaces: package.json scripts, Makefile targets)
+// ---------------------------------------------------------------------------
+
+export { discover, discoverScripts, discoverTargets } from "./command-sources/discover.js";
+export type { CommandInfo, CommandSource } from "./command-sources/command-info.js";
+export type { ParsedMakefileTarget } from "./command-sources/makefile.js";
+export type { PackageJsonScriptConfig, MakefileTargetConfig } from "./command-sources/discover.js";
 // ---------------------------------------------------------------------------
 // Zod re-export
 // ---------------------------------------------------------------------------

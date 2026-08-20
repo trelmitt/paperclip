@@ -229,6 +229,11 @@ export interface HostServices {
     managedReset(params: WorkerToHostMethods["skills.managed.reset"][0]): Promise<WorkerToHostMethods["skills.managed.reset"][1]>;
   };
 
+  /** Provides `commands.discover`. */
+  commands: {
+    discover(params: WorkerToHostMethods["commands.discover"][0]): Promise<WorkerToHostMethods["commands.discover"][1]>;
+  };
+
   /** Provides issue read/write, relation, checkout, wakeup, summary, comment methods. */
   issues: {
     list(params: WorkerToHostMethods["issues.list"][0]): Promise<WorkerToHostMethods["issues.list"][1]>;
@@ -523,6 +528,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "authorization.policies.previewAssignment": "authorization.policies.read",
   "authorization.policies.explainAssignment": "authorization.policies.read",
   "authorization.audit.search": "authorization.audit.read",
+  "commands.discover": "commands.read",
 };
 
 // ---------------------------------------------------------------------------
@@ -1067,6 +1073,9 @@ export function createHostClientHandlers(
     }),
     "authorization.audit.search": gated("authorization.audit.search", async (params) => {
       return services.authorization.searchAudit(params);
+    }),
+    "commands.discover": gated("commands.discover", async (params) => {
+      return services.commands.discover(params);
     }),
   };
 }
