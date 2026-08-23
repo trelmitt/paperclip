@@ -404,6 +404,33 @@ export function attentionIdleDays(item: AttentionItem, now: number): number {
   return Math.floor(attentionIdleMs(item, now) / MS_PER_DAY_DECIDE);
 }
 
+/** Client-side staleness threshold (days) for folding idle *review* rows off the
+ *  desk. Distinct from the server's 30-day aging shelf (ATTENTION_AGING_DAYS). */
+export const ATTENTION_STALE_DAYS = 3;
+
+/**
+ * A review-kind row idle past ATTENTION_STALE_DAYS folds into its own "Stale"
+ * curtain so blockers and fresh decisions keep the desk short. Blocking rows
+ * never fold — an old blocker is still blocking.
+ */
+export function attentionIsStale(item: AttentionItem, now: number): boolean {
+  return attentionKind(item) === "review" && attentionIdleDays(item, now) >= ATTENTION_STALE_DAYS;
+}
+
+/**
+ * A blocker that blocks zero downstream work is stuck but not on anyone's
+ * critical path — the server's own subtitle reads "Blocks 0 tasks". Fold these
+ * into a "Low-impact" curtain so real blockers and fresh decisions own the
+ * desk. Only the terminal-blocker source sets `blockedTaskCount`; a
+ * directly-blocked, human-owned issue (no count) is genuinely actionable and
+ * never folds.
+ */
+export function attentionIsLowImpactBlocker(item: AttentionItem): boolean {
+  if (item.sourceKind !== "blocker_attention") return false;
+  const detail = item.detail;
+  return detail?.kind === "blocker" && detail.blockedTaskCount === 0;
+}
+
 // ---------------------------------------------------------------------------
 // Decide-by control (triage strip) — the segmented options an operator/agent
 // picks from. `date` is handled separately by a date input.
@@ -517,7 +544,7 @@ export function resolveAttentionDateRange(
 // ---------------------------------------------------------------------------
 
 export type AttentionGroupBy = "none" | "date" | "type" | "project" | "severity";
-export type AttentionSortOrder = "newest" | "oldest";
+export type AttentionSortOrder = "priority" | "newest" | "oldest";
 
 /** Ordered list used to render the group-by picker (label + value). */
 export const ATTENTION_GROUP_BY_OPTIONS: ReadonlyArray<[AttentionGroupBy, string]> = [
@@ -529,6 +556,7 @@ export const ATTENTION_GROUP_BY_OPTIONS: ReadonlyArray<[AttentionGroupBy, string
 ];
 
 export const ATTENTION_SORT_OPTIONS: ReadonlyArray<[AttentionSortOrder, string]> = [
+  ["priority", "Needs you first"],
   ["newest", "Newest first"],
   ["oldest", "Oldest first"],
 ];
@@ -599,9 +627,11 @@ export function saveAttentionGroupBy(groupBy: AttentionGroupBy) {
 export function loadAttentionSortOrder(): AttentionSortOrder {
   try {
     const raw = localStorage.getItem(ATTENTION_SORT_KEY);
-    return raw === "oldest" ? "oldest" : "newest";
+    // Default to "priority" (needs-you-first) — the ADHD-friendly desk order.
+    // An explicit newest/oldest choice is still honoured.
+    return raw === "newest" || raw === "oldest" || raw === "priority" ? raw : "priority";
   } catch {
-    return "newest";
+    return "priority";
   }
 }
 
@@ -703,12 +733,24 @@ function attentionActivityTimestamp(item: AttentionItem): number {
   return Number.isFinite(ts) ? ts : 0;
 }
 
+/** Blocking rows sort above review rows in the "priority" order. */
+const ATTENTION_KIND_WEIGHT: Record<AttentionKind, number> = { blocking: 0, review: 1 };
+
 /**
- * Sort by activity time in the requested direction. `rank` is the stable
- * tiebreaker (lower rank = higher priority) so equal-timestamp rows keep the
- * server's escalation order.
+ * Sort the desk. "priority" (the default) is needs-you-first: blocking rows
+ * above review rows, then the server's escalation `rank` (lower = more urgent),
+ * then most-recent activity. "newest"/"oldest" sort purely by activity time,
+ * with `rank` as the stable tiebreaker for equal timestamps.
  */
 export function sortAttentionItems(items: AttentionItem[], order: AttentionSortOrder): AttentionItem[] {
+  if (order === "priority") {
+    return [...items].sort((a, b) => {
+      const kindDiff = ATTENTION_KIND_WEIGHT[attentionKind(a)] - ATTENTION_KIND_WEIGHT[attentionKind(b)];
+      if (kindDiff !== 0) return kindDiff;
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      return attentionActivityTimestamp(b) - attentionActivityTimestamp(a);
+    });
+  }
   const sign = order === "oldest" ? -1 : 1;
   return [...items].sort((a, b) => {
     const diff = attentionActivityTimestamp(b) - attentionActivityTimestamp(a);

@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   approvals,
+  companyMemories,
   documents,
   heartbeatRuns,
   issueApprovals,
@@ -29,6 +30,7 @@ import {
   toolProfiles,
   toolStdioCommandTemplates,
 } from "@paperclipai/db";
+import { searchCompanyMemories } from "./company-memory-search.js";
 import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import type {
   CreateToolMcpGateway,
@@ -267,6 +269,28 @@ const BUILTIN_LOCAL_STDIO_RUNTIME_TEMPLATES: Record<string, Omit<LocalStdioRunti
       "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON",
       "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_PATH",
       "GOOGLE_SHEETS_ALLOWED_SPREADSHEET_IDS",
+    ],
+  },
+  // memlawb — zero-knowledge, end-to-end-encrypted agent memory (pilot).
+  // Runs the memlawb stdio MCP wrapper; requires `bun` + `@gitlawb/memlawb` on
+  // the server/trusted-runtime host (installed in the Dockerfile). The wrapper
+  // holds MEMLAWB_PASSPHRASE and encrypts/decrypts locally, so the remote
+  // memlawb storage server stays crypto-blind. NOTE: because this stdio process
+  // is spawned on the paperclip-server host (not the agent sandbox), plaintext
+  // memory transits Paperclip — zero-knowledge holds relative to the storage
+  // backend, not relative to Paperclip. Env (incl. the passphrase) is sourced by
+  // localStdioEnvironment from the connection's config.env; supply the passphrase
+  // via encrypted connection config or the host env — never commit it. See
+  // docs/integrations/memlawb-memory-pilot.md.
+  "paperclip.memlawb-memory": {
+    command: "memlawb",
+    args: ["mcp"],
+    envKeys: [
+      "MEMLAWB_URL",
+      "MEMLAWB_API_KEY",
+      "MEMLAWB_PASSPHRASE",
+      "MEMLAWB_NAMESPACE",
+      "MEMLAWB_SCAN",
     ],
   },
   "paperclip.echo-calculator-time": {
@@ -584,16 +608,27 @@ function buildHumanizedActionPreview(input: {
       ? "It can permanently change or remove something, so we’re checking with you first."
       : "It can change something, so we’re checking with you first.";
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(input.argumentsSummary.summary);
-  } catch {
-    return trustLine;
+  // Prefer the structured keyArguments (never truncated, files-first sort can't bury a scalar) — this is
+  // what lets the approver actually SEE `target: production` (Round-2 C2). Fall back to parsing the
+  // summary only for older records written before keyArguments existed.
+  let parsed: Record<string, unknown> | null =
+    input.argumentsSummary.keyArguments && typeof input.argumentsSummary.keyArguments === "object"
+      ? input.argumentsSummary.keyArguments
+      : null;
+  if (!parsed) {
+    try {
+      const fromSummary = JSON.parse(input.argumentsSummary.summary);
+      if (fromSummary && typeof fromSummary === "object" && !Array.isArray(fromSummary)) {
+        parsed = fromSummary as Record<string, unknown>;
+      }
+    } catch {
+      return trustLine;
+    }
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return trustLine;
+  if (!parsed) return trustLine;
 
   const fieldLines: string[] = [];
-  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(parsed)) {
     if (fieldLines.length >= 6) break;
     if (isIdentifierArgumentKey(key)) continue;
     const rendered = humanizeArgumentValue(value);
@@ -655,6 +690,43 @@ const BUILTIN_TOOLS: ToolGatewayDescriptor[] = [
     parametersSchema: {
       type: "object",
       properties: { limit: { type: "number" } },
+      additionalProperties: false,
+    },
+    pluginId: "paperclip-self",
+    providerType: "paperclip_self",
+    risk: "read",
+  },
+  {
+    name: "paperclip-self:remember",
+    displayName: "Remember company knowledge",
+    description:
+      "Persist a durable company memory (a fact, decision, convention, or lesson) that any agent on this company can recall in later runs. Use for knowledge worth keeping across runs, not per-issue chatter.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "The knowledge to remember. Be specific and self-contained." },
+        title: { type: "string", description: "Optional short label for the memory." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional topic tags for later recall filtering." },
+      },
+      required: ["content"],
+      additionalProperties: false,
+    },
+    pluginId: "paperclip-self",
+    providerType: "paperclip_self",
+    risk: "write",
+  },
+  {
+    name: "paperclip-self:recall",
+    displayName: "Recall company knowledge",
+    description:
+      "Search durable company memories saved by any agent on this company. Provide a query and/or tags; returns the most relevant recent memories. Call this before starting work to reuse prior knowledge.",
+    parametersSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Keywords to search memory content and titles." },
+        tags: { type: "array", items: { type: "string" }, description: "Only return memories carrying any of these tags." },
+        limit: { type: "number", description: "Max memories to return (default 10, max 50)." },
+      },
       additionalProperties: false,
     },
     pluginId: "paperclip-self",
@@ -1590,10 +1662,18 @@ export function createToolGatewayService(
       }
       throw error;
     }
-    // Board-only technical detail for the formal-approval interaction (target=custom).
+    // Board-only technical detail for the formal-approval interaction (target=custom). Lead with the
+    // compacted Key-arguments block (Round-2 C2) so the approver sees the load-bearing scalars — e.g.
+    // `target: production` — up front, not buried past a 4000-char, files-first-sorted JSON truncation.
+    const keyArgs = input.argumentsSummary.keyArguments;
+    const keyArgLines =
+      keyArgs && typeof keyArgs === "object" && !Array.isArray(keyArgs)
+        ? Object.entries(keyArgs).map(([k, v]) => `- **${k}:** ${typeof v === "string" ? v : JSON.stringify(v)}`)
+        : [];
     const detailsMarkdown = [
       `Tool: \`${input.tool.name}\``,
       `Risk: \`${input.tool.risk}\``,
+      ...(keyArgLines.length ? ["", "Key arguments:", "", ...keyArgLines] : []),
       "",
       "Arguments reviewed for execution:",
       "",
@@ -1999,6 +2079,47 @@ export function createToolGatewayService(
       return {
         content: JSON.stringify(rows),
         data: { issues: rows },
+      };
+    }
+
+    if (tool.name === "paperclip-self:remember") {
+      if (!session.agentId) {
+        throw new ToolGatewayHttpError(403, "Paperclip self tools require an agent-scoped gateway session", "agent_context_required");
+      }
+      const content = typeof params.content === "string" ? params.content.trim() : "";
+      if (!content) {
+        throw new ToolGatewayHttpError(400, "Parameter content is required", "invalid_parameters");
+      }
+      if (content.length > 16000) {
+        throw new ToolGatewayHttpError(400, "Parameter content exceeds the 16000-character memory limit", "invalid_parameters");
+      }
+      const title = typeof params.title === "string" && params.title.trim() ? params.title.trim().slice(0, 200) : null;
+      const tags = Array.isArray(params.tags)
+        ? params.tags.filter((t): t is string => typeof t === "string" && t.trim().length > 0).map((t) => t.trim()).slice(0, 20)
+        : [];
+      const [row] = await db
+        .insert(companyMemories)
+        .values({ companyId: session.companyId, createdByAgentId: session.agentId, title, content, tags })
+        .returning({ id: companyMemories.id, createdAt: companyMemories.createdAt });
+      return {
+        content: JSON.stringify({ id: row?.id, remembered: true }),
+        data: { id: row?.id, createdAt: row?.createdAt },
+      };
+    }
+
+    if (tool.name === "paperclip-self:recall") {
+      if (!session.agentId) {
+        throw new ToolGatewayHttpError(403, "Paperclip self tools require an agent-scoped gateway session", "agent_context_required");
+      }
+      const limit = Math.max(1, Math.min(50, Number(params.limit ?? 10) || 10));
+      const query = typeof params.query === "string" ? params.query : undefined;
+      const tags = Array.isArray(params.tags)
+        ? params.tags.filter((t): t is string => typeof t === "string" && t.trim().length > 0)
+        : undefined;
+      const rows = await searchCompanyMemories(db, session.companyId, { query, tags, limit });
+      return {
+        content: JSON.stringify(rows),
+        data: { memories: rows },
       };
     }
 

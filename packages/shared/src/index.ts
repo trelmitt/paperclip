@@ -1,4 +1,12 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
+
+export {
+  MODEL_PRICING,
+  resolveModelPricing,
+  imputeCostCents,
+  effectiveCostCents,
+} from "./model-pricing.js";
+export type { ModelPrice, TokenUsage, CostEventLike } from "./model-pricing.js";
 export {
   decisionEffectStalenessSchema,
   decisionOptionStyleSchema,
@@ -2373,3 +2381,6 @@ export {
   type FeatureTier,
   type InstanceFeatureKey,
 } from "./feature-catalog.js";
+
+export type { SafetyGuardDeclaration } from "@paperclipai/adapter-utils";
+export { checkShellCommandSafety } from "@paperclipai/adapter-utils";

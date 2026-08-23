@@ -308,7 +308,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    // C1: per-agent gateway identity — consume the per-run runtime MCP gateways the server mints
+    // for this run (empty when the agent has no permitted connections → inherited config untouched).
+    runtimeMcpServers: ctx.runtimeMcp?.getServers() ?? [],
+  });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
@@ -544,12 +550,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
+    // Resume-gate the AGENTS.md re-injection (mirrors codex-local): a resumed
+    // session already received the full instructions on its fresh turn, so
+    // re-prepending them on every wake is pure prefill waste that accretes into
+    // history. Only skip when there is a wake delta to carry the turn — a bare
+    // resume with no delta still needs the instructions.
+    const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
     const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
       : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const prompt = joinPromptSections([
-      instructionsPrefix,
+      promptInstructionsPrefix,
       renderedBootstrapPrompt,
       wakePrompt,
       sessionHandoffNote,
@@ -557,7 +569,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ]);
     const promptMetrics = {
       promptChars: prompt.length,
-      instructionsChars: instructionsPrefix.length,
+      instructionsChars: promptInstructionsPrefix.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
       sessionHandoffChars: sessionHandoffNote.length,

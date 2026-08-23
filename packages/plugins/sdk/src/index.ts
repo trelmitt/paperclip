@@ -284,6 +284,11 @@ export type {
   PluginLogger,
   PluginTracer,
   PluginSpan,
+  SafetyGuardDeclaration,
+} from "./types.js";
+
+export {
+  checkShellCommandSafety,
 } from "./types.js";
 
 // Tracer no-op default (a value, so it re-exports here, not in the type block).

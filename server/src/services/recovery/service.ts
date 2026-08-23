@@ -57,6 +57,7 @@ import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  buildNextSuccessfulRunHandoffAttempt,
   buildSuccessfulRunHandoffExhaustedNotice,
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
@@ -79,14 +80,17 @@ import {
 } from "./issue-graph-liveness.js";
 import {
   recoveryAssigneeAdapterOverrides,
+  withRecoveryEscalationHint,
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
-export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
-export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
+// Widened for slow local inference (2-15 tok/s): a healthy long run no longer
+// looks stalled and mints a harness_liveness_escalation issue too eagerly.
+export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 8 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
@@ -153,6 +157,7 @@ type LatestIssueRun = Pick<
   | "errorCode"
   | "contextSnapshot"
   | "livenessState"
+  | "actionability"
   | "startedAt"
   | "createdAt"
 > & {
@@ -793,6 +798,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        actionability: heartbeatRuns.actionability,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
@@ -823,6 +829,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        actionability: heartbeatRuns.actionability,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
@@ -1062,6 +1069,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        actionability: heartbeatRuns.actionability,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
@@ -1129,27 +1137,44 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    attemptCount?: number;
   }) {
+    // DISABLED 2026-08-17: recovery auto-escalation to the strong model is OFF. Escalating a failed
+    // retry's WHOLE run to the dense 27B times out (a full agent session at ~36 tok/s exceeds the
+    // 1800s run cap -- measured: the only escalate run in history timed out). Retries stay on the
+    // fast fleet model; route hard SUBTASKS to the 27B via the opencode `hard-task` subagent instead.
+    // Flip the flag to restore >=2-attempt escalation (only if the 27B whole-session speed is solved).
+    // See vault: "Dense 27B is a bounded-call engine not a whole-session engine (2026-08-17)".
+    const RECOVERY_ESCALATION_TO_STRONG_MODEL_ENABLED = false;
+    const recoveryEscalationAttemptCount = RECOVERY_ESCALATION_TO_STRONG_MODEL_ENABLED
+      ? input.attemptCount
+      : 0;
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
-      payload: withRecoveryModelProfileHint({
-        issueId: input.issueId,
-        ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
-        ...(input.extraContext ?? {}),
-      }, "normal_model"),
+      payload: withRecoveryEscalationHint(
+        withRecoveryModelProfileHint({
+          issueId: input.issueId,
+          ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+          ...(input.extraContext ?? {}),
+        }, "normal_model"),
+        recoveryEscalationAttemptCount,
+      ),
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: input.issueId,
-        taskId: input.issueId,
-        wakeReason: input.reason,
-        retryReason: input.retryReason,
-        source: input.source,
-        ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
-        ...(input.extraContext ?? {}),
-      }, "normal_model"),
+      contextSnapshot: withRecoveryEscalationHint(
+        withRecoveryModelProfileHint({
+          issueId: input.issueId,
+          taskId: input.issueId,
+          wakeReason: input.reason,
+          retryReason: input.retryReason,
+          source: input.source,
+          ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+          ...(input.extraContext ?? {}),
+        }, "normal_model"),
+        recoveryEscalationAttemptCount,
+      ),
     });
 
     if (queued && input.retryOfRunId) {
@@ -3662,6 +3687,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
+      successfulRunHandoffRetried: 0,
       reviewParticipantRequeued: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
@@ -4115,9 +4141,48 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
-      if (handoffEvidence) {
+      if (handoffEvidence && latestRun) {
         if (!handoffEvidence.exhausted) {
-          result.skipped += 1;
+          // The corrective handoff run (attempt N) ALSO ended without a disposition, but attempts
+          // remain. Enqueue attempt N+1 — the code to do this was never written, so this branch used to
+          // `skipped++; continue` forever: attempts 2–3 never ran and the exhausted→escalate branch below
+          // was unreachable, turning a first miss into an infinite skip (Round-2 B1). Pause is already
+          // gated upstream (isAutomaticRecoverySuppressedByPauseHold); mirror the attempt-1 budget guard.
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+          const correctiveRunStartedAtMs = new Date(
+            latestRun.startedAt ?? latestRun.createdAt ?? recoveryNow,
+          ).getTime();
+          const next = buildNextSuccessfulRunHandoffAttempt({
+            evidence: { ...handoffEvidence, livenessState: latestRun.livenessState ?? null },
+            issue,
+            agentId,
+            correctiveRunStartedAtMs,
+            nowMs: recoveryNow.getTime(),
+          });
+          if (next.kind === "enqueue") {
+            const queued = await deps.enqueueWakeup(next.targetAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+              idempotencyKey: next.idempotencyKey,
+              payload: next.payload,
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              contextSnapshot: next.contextSnapshot,
+            });
+            if (queued) {
+              result.successfulRunHandoffRetried += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          } else {
+            // "wait" (backoff not elapsed) or "exhausted" (defensive) — leave for a later sweep.
+            result.skipped += 1;
+          }
           continue;
         }
 
@@ -4138,6 +4203,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
+
+        // A successful run that flagged a manager/human-review change (e.g. a
+        // production deploy, secret rotation, or strategy call) must not be
+        // auto-continued. Route it to the same blocked + manager-owner
+        // escalation used elsewhere so a human reviews the flagged change
+        // before the issue resumes. manager_review is the only actionability
+        // that maps to a successful needs_followup run, so the guard is enough.
+        if (successfulRun.actionability === "manager_review") {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun: successfulRun,
+            comment:
+              "This run flagged a change that needs manager or human review before it is safe to continue. " +
+              "Moving it to `blocked` so a manager reviews the flagged change before the issue resumes.",
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
@@ -4197,6 +4286,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         continue;
       }
+      // Carries the genuine repeated-failure count out to the re-attempt enqueue below, so a task
+      // that has failed >=2 times gets the strong ("escalate") model on its next real retry.
+      let continuationFailureCount = 0;
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         const classification = classifyContinuationFailure(latestRun);
 
@@ -4239,6 +4331,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             agentId,
             classification.errorCode,
           );
+          continuationFailureCount = consecutive;
           if (consecutive >= classification.maxAttempts) {
             const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
             const updated = await escalateStrandedAssignedIssue({
@@ -4287,6 +4380,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        attemptCount: continuationFailureCount,
       });
       if (queued) {
         result.continuationRequeued += 1;

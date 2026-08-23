@@ -142,6 +142,7 @@ export type {
   PrincipalPermissionGrant,
   PrincipalType,
   EnvSecretRefBinding,
+  SafetyGuardDeclaration,
 } from "@paperclipai/shared";
 
 // ---------------------------------------------------------------------------
@@ -2139,3 +2140,11 @@ export interface PluginContext {
    * only when tracing is on and an active host trace context is present. */
   tracer: PluginTracer;
 }
+
+// ---------------------------------------------------------------------------
+// Execution utilities
+// ---------------------------------------------------------------------------
+
+import { checkShellCommandSafety } from "@paperclipai/adapter-utils";
+
+export { checkShellCommandSafety };
