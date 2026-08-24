@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Sanctioned deploy path for the Paperclip control plane (launchd label: com.rhen.paperclip).
+#
+# Prevents the two self-inflicted outage classes seen 2026-08:
+#   (a) restarting a STALE or RED dist  -> launchd KeepAlive crash-loops (08-22), and
+#   (b) a rebuilt dist that is never restarted -> fix-on-disk-but-not-running
+#       (the 08-23 Rhen-dashboard incident: fix built 08-22 23:22, not live until 17:41 next
+#        day = ~18h of 500s while the fix sat unused on disk).
+#
+# This is the ONLY approved way to deploy. It refuses to restart unless typecheck + build are
+# green AND dist is fresh, verifies health after, and rolls back on a crash-loop. The gate runs
+# at DEPLOY time (a red tree just aborts the deploy) — never at launch time, so it can never
+# crash-loop the service the way the 08-22 launch-time wrapper did.
+#
+#   bin/deploy              typecheck -> build -> freshness gate -> restart -> health (+rollback)
+#   bin/deploy --check      report only: is the RUNNING process older than dist? (staleness alarm)
+#   bin/deploy --no-restart typecheck + build + freshness gate, do NOT touch the running service
+set -euo pipefail
+
+LABEL="com.rhen.paperclip"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+DIST="$ROOT/server/dist/index.js"
+HEALTH_URL="http://127.0.0.1:3100/api/health"
+
+running_pid() { launchctl list "$LABEL" 2>/dev/null | awk -F'= ' '/"PID"/{gsub(/[^0-9]/,"",$2);print $2}'; }
+
+pid_epoch() {  # macOS `ps -o lstart` -> epoch seconds
+  local ls; ls="$(ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//')" || return 1
+  [ -n "$ls" ] && date -j -f '%a %b %e %T %Y' "$ls" +%s 2>/dev/null
+}
+
+# src files that actually compile into dist (exclude tests/fixtures so a newer test file
+# doesn't false-trip the freshness gate)
+src_newer_than_dist() {
+  find server/src packages/*/src -type f -name '*.ts' \
+    ! -name '*.test.ts' ! -path '*/__tests__/*' -newer "$DIST" 2>/dev/null
+}
+
+check_staleness() {
+  local pid; pid="$(running_pid)"
+  [ -n "$pid" ] || { echo "STALENESS: no running $LABEL process"; return 2; }
+  [ -f "$DIST" ] || { echo "STALENESS: no $DIST on disk"; return 2; }
+  local pe de; pe="$(pid_epoch "$pid" || echo 0)"; de="$(stat -f %m "$DIST")"
+  if [ "${pe:-0}" -gt 0 ] && [ "$de" -gt "$pe" ]; then
+    echo "STALE: dist built $(date -r "$de" '+%F %T') is NEWER than running pid $pid started $(date -r "$pe" '+%F %T')"
+    echo "  -> a built fix is NOT deployed. Deploy it:  bin/deploy"
+    return 1
+  fi
+  echo "OK: running pid $pid (started $(date -r "${pe:-0}" '+%F %T')) is at or ahead of dist ($(date -r "$de" '+%F %T'))"
+  return 0
+}
+
+build_green() {
+  echo "[typecheck] pnpm -r typecheck"; pnpm -r typecheck
+  echo "[build] pnpm build"; pnpm build
+  local newer; newer="$(src_newer_than_dist || true)"
+  if [ -n "$newer" ]; then
+    echo "FRESHNESS FAIL: source newer than dist after build (build did not cover these):"
+    echo "$newer" | sed 's/^/  /'
+    return 1
+  fi
+  echo "[freshness] dist is up to date with src"
+}
+
+deploy() {
+  build_green
+  echo "[backup] server/dist -> server/dist.bak"; rm -rf server/dist.bak; cp -R server/dist server/dist.bak
+  echo "[restart] launchctl kickstart -k gui/$(id -u)/$LABEL"; launchctl kickstart -k "gui/$(id -u)/$LABEL"
+  # Embedded Postgres cold-starts slowly here (~45-60s); a single short check false-trips a rollback
+  # (the "5s verify sees false 000" trap). Poll up to 90s for a real 200 before deciding.
+  local code=000 waited=0
+  while [ "$waited" -lt 90 ]; do
+    sleep 3; waited=$((waited+3))
+    code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)"
+    [ "$code" = "200" ] && break
+    echo "  [health] waiting for control plane... ${waited}s (last=$code)"
+  done
+  if [ "$code" = "200" ]; then
+    echo "[health] OK (200). Deploy complete."; rm -rf server/dist.bak
+    check_staleness || true
+  else
+    echo "[health] FAIL ($code) -> ROLLING BACK to server/dist.bak"
+    rm -rf server/dist && mv server/dist.bak server/dist
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    echo "[rollback] restored previous dist and restarted. Investigate before retrying."
+    exit 1
+  fi
+}
+
+case "${1:-deploy}" in
+  --check)      check_staleness ;;
+  --no-restart) build_green; echo "green build verified; service NOT restarted (--no-restart)" ;;
+  deploy|"")    deploy ;;
+  *) echo "usage: bin/deploy [--check|--no-restart]"; exit 2 ;;
+esac
