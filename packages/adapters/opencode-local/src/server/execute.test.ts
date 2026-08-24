@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ensureRemoteOpenCodeModelConfiguredAndAvailable } from "./execute.js";
+import {
+  ensureRemoteOpenCodeModelConfiguredAndAvailable,
+  orderPromptSectionsForCache,
+} from "./execute.js";
 
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
@@ -58,5 +61,31 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
         graceSec: 5,
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe("orderPromptSectionsForCache", () => {
+  const parts = {
+    instructionsPrefix: "INSTR", // static (per-agent file)
+    renderedPrompt: "CONTRACT", // stable (per-agent standing contract)
+    renderedBootstrapPrompt: "BOOTSTRAP", // volatile (runId)
+    sessionHandoffNote: "HANDOFF", // volatile
+    wakePrompt: "WAKE", // volatile (freshest)
+  };
+
+  it("orders stable sections before volatile ones (KV prefix-cache invariant)", () => {
+    const ordered = orderPromptSectionsForCache(parts);
+    expect(ordered).toEqual(["INSTR", "CONTRACT", "BOOTSTRAP", "HANDOFF", "WAKE"]);
+    // The regression this guards: the standing contract (stable) must precede the volatile
+    // per-run sections, or the ~1500-token contract can never enter the cached prefix.
+    expect(ordered.indexOf("CONTRACT")).toBeLessThan(ordered.indexOf("BOOTSTRAP"));
+    expect(ordered.indexOf("CONTRACT")).toBeLessThan(ordered.indexOf("WAKE"));
+    // Wake (the freshest, most specific instruction) lands last.
+    expect(ordered[ordered.length - 1]).toBe("WAKE");
+  });
+
+  it("preserves all sections (order-only; content unchanged)", () => {
+    const ordered = orderPromptSectionsForCache(parts);
+    expect([...ordered].sort()).toEqual(Object.values(parts).sort());
   });
 });

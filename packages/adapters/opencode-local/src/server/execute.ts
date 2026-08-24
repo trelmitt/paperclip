@@ -67,6 +67,35 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+/**
+ * Order the OpenCode user-prompt sections for KV prefix-cache reuse.
+ *
+ * Prefix caching keys on the longest common token prefix across requests, so an agent's repeated
+ * heartbeats reuse cache only up to the first section that changes. Stable sections (the per-agent
+ * instructions file + the standing execution contract) are identical run-to-run, so they lead and
+ * form the shared cached prefix; volatile per-run sections (session bootstrap with runId, prior-
+ * session handoff, and the wake reason) trail so they only invalidate the short tail. Landing the
+ * wake/task last also gives the model its freshest, most specific instruction at the generation point.
+ *
+ * Order-only: content is unchanged and joinPromptSections drops empties, so this is safe regardless
+ * of which sections are present on a given run (fresh vs resume vs recovery).
+ */
+export function orderPromptSectionsForCache(sections: {
+  instructionsPrefix: string;
+  renderedPrompt: string;
+  renderedBootstrapPrompt: string;
+  sessionHandoffNote: string;
+  wakePrompt: string;
+}): string[] {
+  return [
+    sections.instructionsPrefix, // static: per-agent instructions file
+    sections.renderedPrompt, // stable: per-agent standing execution contract
+    sections.renderedBootstrapPrompt, // volatile: session bootstrap (interpolates runId)
+    sections.sessionHandoffNote, // volatile: prior-session handoff
+    sections.wakePrompt, // volatile: why this heartbeat woke (freshest)
+  ];
+}
+
 function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
@@ -548,13 +577,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ""
       : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-    const prompt = joinPromptSections([
-      instructionsPrefix,
-      renderedBootstrapPrompt,
-      wakePrompt,
-      sessionHandoffNote,
-      renderedPrompt,
-    ]);
+    // Stable-first, volatile-last for KV prefix-cache reuse (see orderPromptSectionsForCache).
+    const prompt = joinPromptSections(
+      orderPromptSectionsForCache({
+        instructionsPrefix,
+        renderedPrompt,
+        renderedBootstrapPrompt,
+        sessionHandoffNote,
+        wakePrompt,
+      }),
+    );
     const promptMetrics = {
       promptChars: prompt.length,
       instructionsChars: instructionsPrefix.length,
