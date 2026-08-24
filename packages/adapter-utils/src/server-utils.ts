@@ -155,6 +155,19 @@ export function resolvePaperclipInstanceRootForAdapter(input: {
   return path.resolve(homeDir, "instances", instanceId);
 }
 
+// Last-resort execution cwd when a run reaches an adapter with no stamped
+// workspace cwd and no configured cwd. Never fall back to process.cwd(): for a
+// control-plane server launched from its own repo that silently writes agent
+// scratch into the deploy tree, which breaks the monorepo typecheck gate on the
+// next deploy. Redirect to an off-tree per-agent home under the instance dir
+// instead (the caller's ensureAbsoluteDirectory creates it). Honors
+// PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID like the rest of the system.
+export function resolveAdapterFallbackCwd(agent: { id?: string } | null | undefined): string {
+  const root = resolvePaperclipInstanceRootForAdapter();
+  const agentId = agent?.id?.trim();
+  return agentId ? path.join(root, "workspaces", agentId) : path.join(root, "workspaces");
+}
+
 export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
   "",

@@ -14,6 +14,7 @@ import {
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
+  resolveAdapterFallbackCwd,
   selectPaperclipTaskMarkdown,
   runningProcesses,
   runChildProcess,
@@ -2576,5 +2577,57 @@ describe("appendWithByteCap", () => {
     expect(output).not.toContain("\uFFFD");
     expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output);
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
+  });
+});
+
+describe("resolveAdapterFallbackCwd", () => {
+  // Regression guard: an unworkspaced/unstamped run must NEVER fall back to
+  // process.cwd() (which for the control-plane server is its own repo — agent
+  // scratch there breaks the monorepo typecheck deploy gate). Every adapter's
+  // execute() resolves cwd through this helper's last `||` branch.
+  const withEnv = <T>(vars: Record<string, string | undefined>, fn: () => T): T => {
+    const prev: Record<string, string | undefined> = {};
+    for (const k of Object.keys(vars)) prev[k] = process.env[k];
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      return fn();
+    } finally {
+      for (const [k, v] of Object.entries(prev)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  };
+
+  it("returns an off-tree per-agent home, never process.cwd()", () => {
+    const home = path.join(os.tmpdir(), `pc-fallback-${randomUUID()}`);
+    const cwd = withEnv({ PAPERCLIP_HOME: home, PAPERCLIP_INSTANCE_ID: undefined }, () =>
+      resolveAdapterFallbackCwd({ id: "agent-123" }),
+    );
+    expect(cwd).toBe(path.resolve(home, "instances", "default", "workspaces", "agent-123"));
+    expect(cwd).not.toBe(process.cwd());
+    expect(path.isAbsolute(cwd)).toBe(true);
+  });
+
+  it("honors PAPERCLIP_INSTANCE_ID", () => {
+    const home = path.join(os.tmpdir(), `pc-fallback-${randomUUID()}`);
+    const cwd = withEnv({ PAPERCLIP_HOME: home, PAPERCLIP_INSTANCE_ID: "staging" }, () =>
+      resolveAdapterFallbackCwd({ id: "a1" }),
+    );
+    expect(cwd).toBe(path.resolve(home, "instances", "staging", "workspaces", "a1"));
+  });
+
+  it("does not throw on a missing/empty agent id", () => {
+    const home = path.join(os.tmpdir(), `pc-fallback-${randomUUID()}`);
+    for (const agent of [null, undefined, {}, { id: "" }, { id: "  " }] as const) {
+      const cwd = withEnv({ PAPERCLIP_HOME: home, PAPERCLIP_INSTANCE_ID: undefined }, () =>
+        resolveAdapterFallbackCwd(agent),
+      );
+      expect(cwd).toBe(path.resolve(home, "instances", "default", "workspaces"));
+      expect(cwd).not.toBe(process.cwd());
+    }
   });
 });

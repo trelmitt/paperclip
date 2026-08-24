@@ -35,6 +35,7 @@ import {
   applyPaperclipWorkspaceEnv,
   asNumber,
   asString,
+  resolveAdapterFallbackCwd,
   buildInvocationEnvForLogs,
   buildPaperclipEnv,
   ensureAbsoluteDirectory,
@@ -1409,7 +1410,7 @@ async function buildRuntime(input: {
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
-  const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  const cwd = effectiveWorkspaceCwd || configuredCwd || resolveAdapterFallbackCwd(agent);
   // Referenced (additional) projects to stage into the sandbox alongside the
   // anchor workspace, read from the workspace realization record. The list is
   // empty unless run prep resolved referenced projects — gated upstream by the

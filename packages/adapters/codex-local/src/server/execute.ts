@@ -30,6 +30,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
+  resolveAdapterFallbackCwd,
   asNumber,
   parseObject,
   buildPaperclipEnv,
@@ -601,7 +602,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = targetWorkspaceRealization?.mode === "in_place"
     ? targetWorkspaceRealization.authoritativeRoot
     : useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
-  const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  const cwd = effectiveWorkspaceCwd || configuredCwd || resolveAdapterFallbackCwd(agent);
   const envConfig = parseObject(config.env);
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const configuredCodexHome =

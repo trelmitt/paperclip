@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
+  resolveAdapterFallbackCwd,
   asNumber,
   asStringArray,
   parseObject,
@@ -248,7 +249,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
-  const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  const cwd = effectiveWorkspaceCwd || configuredCwd || resolveAdapterFallbackCwd(agent);
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
 
