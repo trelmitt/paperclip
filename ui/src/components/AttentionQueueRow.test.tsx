@@ -133,7 +133,7 @@ function buildItem(overrides: Partial<AttentionItem> = {}): AttentionItem {
 const noop = () => {};
 
 describe("AttentionQueueRow", () => {
-  it("renders an inline approval resolver when expanded", () => {
+  it("renders an inline approval resolver when expanded, with an Open task escape hatch", () => {
     const el = render(
       <AttentionQueueRow
         item={buildItem()}
@@ -146,8 +146,22 @@ describe("AttentionQueueRow", () => {
     expect(el.textContent).toContain("Approve");
     expect(el.textContent).toContain("Request revision");
     expect(el.textContent).toContain("Reject");
-    // Inline rows show an expand chevron, not an "Open" deep-link.
-    expect(el.textContent).not.toContain("Open");
+    // Expanded inline rows offer a clear "Open task" escape hatch to the full task.
+    const openTask = Array.from(el.querySelectorAll("a")).find((a) => a.textContent?.includes("Open task"));
+    expect(openTask?.getAttribute("href")).toBe("/PAP/approvals/approval-1");
+  });
+
+  it("does not show the Open task escape hatch while the inline row is collapsed", () => {
+    const el = render(
+      <AttentionQueueRow
+        item={buildItem()}
+        companyId="c1"
+        expanded={false}
+        onToggleExpand={noop}
+        onDismiss={noop}
+      />,
+    );
+    expect(Array.from(el.querySelectorAll("a")).some((a) => a.textContent?.includes("Open task"))).toBe(false);
   });
 
   it("inlines a stalled review with the three review verbs (PAP-16080 §4.4)", () => {
@@ -173,8 +187,8 @@ describe("AttentionQueueRow", () => {
         onDismiss={noop}
       />,
     );
-    // Inline rows resolve in place, not via an "Open" deep-link.
-    expect(el.textContent).not.toContain("Open");
+    // Inline rows resolve in place; the only "Open" is the task escape hatch.
+    expect(Array.from(el.querySelectorAll("a")).some((a) => a.textContent?.includes("Open task"))).toBe(true);
     expect(el.textContent).toContain("Approve");
     expect(el.textContent).toContain("Request changes");
     expect(el.textContent).toContain("Send back to work");
@@ -525,8 +539,9 @@ describe("AttentionQueueRow", () => {
     expect(onToggleExpand).not.toHaveBeenCalled();
   });
 
-  it("opens the matching confirmation form when requesting changes from a compact action", () => {
+  it("rejects inline from a compact action, without expanding the row", async () => {
     const onToggleExpand = vi.fn();
+    vi.mocked(issuesApi.rejectInteraction).mockResolvedValue({} as never);
     render(
       <AttentionQueueRow
         item={buildItem({
@@ -555,8 +570,11 @@ describe("AttentionQueueRow", () => {
     );
     act(() => requestChanges?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
-    expect(onToggleExpand).toHaveBeenCalledOnce();
-    expect(issuesApi.rejectInteraction).not.toHaveBeenCalled();
+    // Decline now resolves in place (symmetric with Confirm), rather than
+    // expanding the row's resolver — the compact reject verb is a bare decline.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(issuesApi.rejectInteraction).toHaveBeenCalledWith("issue-1", "interaction-1");
+    expect(onToggleExpand).not.toHaveBeenCalled();
   });
 
   // The old context row bundled project identity + thumbnails together; project

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyRunLiveness } from "../services/run-liveness.ts";
+import { classifyRunLiveness, isDegenerateOutput } from "../services/run-liveness.ts";
 
 const baseInput = {
   runStatus: "succeeded",
@@ -227,5 +227,320 @@ describe("run liveness classifier", () => {
     expect(classification.livenessState).toBe("needs_followup");
     expect(classification.actionability).toBe("unknown");
     expect(classification.nextAction).toBeNull();
+  });
+
+  it("does not let a negation mask a required approval", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        summary: "Not blocked, but I need board approval before deploying the change.",
+      },
+    });
+
+    expect(classification.actionability).toBe("approval_required");
+    expect(classification.livenessState).toBe("blocked");
+  });
+
+  it("does not let a negation mask a manager/escalation signal", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        summary: "No blockers remaining; escalate to security review before rotating the API secret.",
+      },
+    });
+
+    expect(classification.actionability).toBe("manager_review");
+    expect(classification.livenessState).toBe("needs_followup");
+  });
+
+  it("escalates a manager-review run to human review even with concrete evidence", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        summary: "Finished the change and will escalate to security review before the production deploy.",
+      },
+      evidence: {
+        issueCommentsCreated: 1,
+        workProductsCreated: 1,
+        latestEvidenceAt: new Date("2026-04-18T12:00:00Z"),
+      },
+    });
+
+    // Without the escalation gate this run's concrete evidence would classify it
+    // as "advanced" and let it auto-continue.
+    expect(classification.actionability).toBe("manager_review");
+    expect(classification.livenessState).toBe("needs_followup");
+  });
+
+  it("still lets a negation relax a plain runnable follow-up", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: {
+        summary: "No blockers; run pnpm test to verify the change.",
+      },
+    });
+
+    expect(classification.actionability).toBe("runnable");
+  });
+
+  describe("adversarial table-driven test matrix", () => {
+    const testCases: Array<{
+      name: string;
+      summary: string;
+      issueComment?: string[];
+      evidence?: Record<string, unknown>;
+      humanReviewRequired: boolean;
+      expectedActionability: "approval_required" | "manager_review" | "blocked_external" | "runnable";
+      expectedLiveness: "blocked" | "needs_followup";
+    }> = [
+      // === negation + approval_required ===
+      {
+        name: "negated blocker with explicit approval need",
+        summary: "Not blocked, but I need board approval before deploying the change.",
+        expectedActionability: "approval_required",
+        expectedLiveness: "blocked",
+        humanReviewRequired: true,
+      },
+      {
+        name: "negated blocker with approval nested in mid-sentence",
+        summary: "There's no blocker here; the only pending item is approval from the security team.",
+        expectedActionability: "approval_required",
+        expectedLiveness: "blocked",
+        humanReviewRequired: true,
+      },
+      {
+        name: "negation does NOT suppress a pending approval from issue comments",
+        summary: "No blockers remaining.",
+        issueComment: ["Pending approval from the board before we can proceed with deployment.", "Next action: deploy."],
+        expectedActionability: "approval_required",
+        expectedLiveness: "blocked",
+        humanReviewRequired: true,
+      },
+      // === negation + manager_review ===
+      {
+        name: "negated blocker with manager review signal",
+        summary: "No blockers left; escalate to security review before rotating the keys.",
+        expectedActionability: "manager_review",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: true,
+      },
+      {
+        name: "negation does NOT suppress a deploy-to-production signal",
+        summary: "Not blocked; continuing to deploy to prod.",
+        expectedActionability: "manager_review",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: true,
+      },
+      {
+        name: "negation + manager review from issue comment",
+        summary: "All clear with no issues.",
+        issueComment: ["We need a production deploy after this pass.", "Next step: run integration tests."],
+        expectedActionability: "manager_review",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: true,
+      },
+      // === manager_review + concrete evidence ===
+      {
+        name: "manager_review with concrete evidence still needs followup (not advanced)",
+        summary: "Deploy to prod after verifying",
+        evidence: {
+          issueCommentsCreated: 2,
+          workProductsCreated: 1,
+          latestEvidenceAt: "2026-04-18T12:00:00Z",
+        },
+        expectedActionability: "manager_review",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: true,
+      },
+      // === negation + blocked_external ===
+      {
+        name: "negated external blocker becomes runnable",
+        summary: "Not blocked; no more credentials needed.",
+        expectedActionability: "unknown",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: false,
+      },
+      {
+        name: "negated external blocker with future task stays runnable",
+        summary: "No blockers; run npm test to verify.",
+        expectedActionability: "runnable",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: false,
+      },
+      // === approval_required without negation ===
+      {
+        name: "plain approval request with no negation",
+        summary: "I need approval before deploying this change.",
+        expectedActionability: "approval_required",
+        expectedLiveness: "blocked",
+        humanReviewRequired: true,
+      },
+      // === manager_review without negation ===
+      {
+        name: "plain production deploy signal",
+        summary: "Deploy to production and verify live traffic.",
+        expectedActionability: "manager_review",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: true,
+      },
+      // === BOTH approval + manager_review signals ===
+      {
+        name: "both approval and manager review in same output (approval wins)",
+        summary: "Not blocked, but I need board approval before the production deploy.",
+        expectedActionability: "approval_required",
+        expectedLiveness: "blocked",
+        humanReviewRequired: true,
+      },
+      // === negation that mimics but does NOT match ===
+      {
+        name: "negation of unrelated text leaves blocked_external intact",
+        summary: "Not blocked by the board, but I need API credentials to proceed.",
+        expectedActionability: "blocked_external",
+        expectedLiveness: "blocked",
+        humanReviewRequired: false,
+      },
+      {
+        name: "negation only affects the blocked part but actionability is runnable",
+        summary: "Not blocked; run pnpm test to verify the change.",
+        expectedActionability: "runnable",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: false,
+      },
+      {
+        name: "no blocker declared plus vague next task isn't blocked or approval",
+        summary: "Not blocked; next: follow the run instructions to validate.",
+        expectedActionability: "runnable",
+        expectedLiveness: "needs_followup",
+        humanReviewRequired: false,
+      },
+    ];
+
+    for (const tc of testCases) {
+      it(tc.name, () => {
+        const classification = classifyRunLiveness({
+          ...baseInput,
+          resultJson: {
+            summary: tc.summary,
+          },
+          issueCommentBodies: tc.issueComment ? [tc.issueComment.join("\n")] : undefined,
+          evidence: tc.evidence as Record<string, unknown> ? {
+            ...tc.evidence,
+          } : undefined,
+        });
+
+        expect(classification.actionability).toBe(tc.expectedActionability);
+        expect(classification.livenessState).toBe(tc.expectedLiveness);
+
+        if (tc.humanReviewRequired) {
+          expect(classification.livenessState).not.toBe("advanced");
+        }
+      });
+    }
+  });
+
+  // Lifecycle golden corpus: locks the run-status / issue-status / evidence axis
+  // that the adversarial matrix (text-actionability only) does not cover, so every
+  // RunLivenessState has a pinned case. A regression here flips a real run's fate.
+  describe("lifecycle golden corpus", () => {
+    const evidenceAt = new Date("2026-04-18T12:00:00Z");
+    const lifecycleCases: Array<{
+      name: string;
+      input: Parameters<typeof classifyRunLiveness>[0];
+      expectedLiveness: string;
+    }> = [
+      {
+        name: "interrupted run -> needs_followup",
+        input: { ...baseInput, runStatus: "interrupted", errorCode: "session_reset" },
+        expectedLiveness: "needs_followup",
+      },
+      {
+        name: "adapter-failed run -> failed",
+        input: { ...baseInput, runStatus: "failed", errorCode: "adapter_failed" },
+        expectedLiveness: "failed",
+      },
+      {
+        name: "timed-out run -> failed",
+        input: { ...baseInput, runStatus: "timeout" },
+        expectedLiveness: "failed",
+      },
+      {
+        name: "issue already done -> completed",
+        input: { ...baseInput, issue: { ...baseInput.issue, status: "done" } },
+        expectedLiveness: "completed",
+      },
+      {
+        name: "issue cancelled -> completed",
+        input: { ...baseInput, issue: { ...baseInput.issue, status: "cancelled" } },
+        expectedLiveness: "completed",
+      },
+      {
+        name: "succeeded with no output or evidence -> empty_response",
+        input: { ...baseInput },
+        expectedLiveness: "empty_response",
+      },
+      {
+        name: "concrete action evidence -> advanced",
+        input: {
+          ...baseInput,
+          resultJson: { summary: "Applied the change." },
+          evidence: { issueCommentsCreated: 1, workProductsCreated: 1, latestEvidenceAt: evidenceAt },
+        },
+        expectedLiveness: "advanced",
+      },
+      {
+        name: "plan-document revision with useful output -> advanced",
+        input: {
+          ...baseInput,
+          resultJson: { summary: "Drafted the implementation plan." },
+          evidence: { planDocumentRevisionsCreated: 1, latestEvidenceAt: evidenceAt },
+        },
+        expectedLiveness: "advanced",
+      },
+      {
+        name: "useful completed output, no concrete evidence -> needs_followup",
+        input: { ...baseInput, resultJson: { summary: "Corrected the typo in the configuration comment." } },
+        expectedLiveness: "needs_followup",
+      },
+    ];
+
+    for (const tc of lifecycleCases) {
+      it(tc.name, () => {
+        expect(classifyRunLiveness(tc.input).livenessState).toBe(tc.expectedLiveness);
+      });
+    }
+  });
+});
+
+describe("degeneracy screen (Round-2 B2)", () => {
+  const repeatedLine = Array.from({ length: 25 }, () => "Processing the data now.").join("\n"); // 25 lines, 1 distinct
+  const cjkLoop = "数据分析报告".repeat(150); // ~900 chars, no newlines, tight token loop (period 6)
+  const legitPlan = [
+    "## Rollout plan",
+    "1. Audit the current auth middleware and list every caller.",
+    "2. Introduce a feature flag `new_auth` defaulting off.",
+    "3. Migrate the login route first, behind the flag, with a rollback note.",
+    "4. Add integration tests for the flagged and unflagged paths.",
+    "5. Enable for 5 percent of traffic and watch error rates for a day.",
+    "6. Ramp to full once the dashboards are clean, then remove the flag.",
+  ].join("\n");
+  const planIssue = { status: "in_progress", title: "Plan the auth rollout", description: "Write a rollout plan." };
+
+  it("flags a line-repetition loop as degenerate", () => {
+    expect(isDegenerateOutput(repeatedLine)).toBe(true);
+  });
+  it("flags a newline-free CJK token loop as degenerate", () => {
+    expect(isDegenerateOutput(cjkLoop)).toBe(true);
+  });
+  it("skips short output (a bounded continuation handles that)", () => {
+    expect(isDegenerateOutput("done.")).toBe(false);
+  });
+  it("does not flag a diverse, substantive plan", () => {
+    expect(isDegenerateOutput(`${legitPlan}\n${legitPlan}`)).toBe(false);
+  });
+  it("routes a degenerate plan-task run to empty_response instead of laundering to advanced", () => {
+    expect(classifyRunLiveness({ ...baseInput, issue: planIssue, resultJson: { summary: repeatedLine } }).livenessState).toBe("empty_response");
+  });
+  it("still grades a legit plan-task run advanced (no false positive)", () => {
+    expect(classifyRunLiveness({ ...baseInput, issue: planIssue, resultJson: { summary: legitPlan } }).livenessState).toBe("advanced");
   });
 });

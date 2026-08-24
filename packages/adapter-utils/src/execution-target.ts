@@ -174,6 +174,7 @@ export interface AdapterExecutionTargetShellOptions {
   timeoutSec?: number;
   graceSec?: number;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  safetyGuards?: SafetyGuardDeclaration[];
 }
 
 export interface AdapterExecutionTargetPaperclipBridgeHandle {
@@ -650,9 +651,22 @@ export async function runAdapterExecutionTargetShellCommand(
   runId: string,
   target: AdapterExecutionTarget | null | undefined,
   command: string,
-  options: AdapterExecutionTargetShellOptions,
+  options: AdapterExecutionTargetShellOptions & { safetyGuards?: SafetyGuardDeclaration[] },
 ): Promise<RunProcessResult> {
   const onLog = options.onLog ?? (async () => {});
+
+  // Check safety guards before executing command
+  if (options.safetyGuards && options.safetyGuards.length > 0) {
+    const blockedGuard = checkShellCommandSafety(command, options.safetyGuards);
+    if (blockedGuard) {
+      // Find the guard details for error message
+      const guard = options.safetyGuards.find((g) => g.guardKey === blockedGuard);
+      throw new Error(
+        `Command blocked by safety guard: ${guard?.displayName || blockedGuard}. ${guard?.description || "This command is not allowed."}`,
+      );
+    }
+  }
+
   if (target?.kind === "remote") {
     const startedAt = new Date().toISOString();
     const env = sanitizeRemoteExecutionEnv(options.env);
@@ -2147,9 +2161,45 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         server?.stop(),
       ]);
       await Promise.allSettled([
-        worker?.stop(),
+         worker?.stop(),
         bridgeAsset.cleanup(),
       ]);
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Safety guard enforcement
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a shell command matches any blocked patterns in safety guards.
+ * Returns the first matching guard key if blocked, or null if command is safe.
+ */
+export function checkShellCommandSafety(
+  command: string,
+  guards: Array<{ guardKey: string; displayName: string; description: string; blockPattern: string }>,
+): string | null {
+  for (const guard of guards) {
+    try {
+      const pattern = new RegExp(guard.blockPattern);
+      if (pattern.test(command)) {
+        return guard.guardKey;
+      }
+    } catch {
+      // If the pattern is invalid, skip this guard
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * Type alias for safety guard declaration to avoid circular dependency
+ */
+export type SafetyGuardDeclaration = {
+  guardKey: string;
+  displayName: string;
+  description: string;
+  blockPattern: string;
+};

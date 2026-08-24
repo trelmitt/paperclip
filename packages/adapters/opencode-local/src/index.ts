@@ -65,6 +65,12 @@ export const models: Array<{ id: string; label: string }> = [
 
 export const DEFAULT_OPENCODE_CHEAP_MODEL = "openai/gpt-5.1-codex-mini";
 
+// The "escalate" profile model: auto-selected on repeated-failure re-attempts (attempt >= 2).
+// Source default stays an OpenAI codex to match this file's convention; the local venture-studio
+// deployment overrides it via PAPERCLIP_OPENCODE_STRONG_MODEL to point at the omlx dense-27B
+// behind the :8010 concurrency-capping proxy (e.g. "omlx-strong/mlx-community--Qwen3.8-27B-4bit").
+export const DEFAULT_OPENCODE_STRONG_MODEL = "openai/gpt-5.2-codex";
+
 // The "cheap" budget profile (used for recovery retries and other low-cost lanes).
 // Defaults to OpenCode's known Codex mini model, but is overridable so a deployment
 // routing through a gateway that does not serve that model (e.g. an EU LLM gateway)
@@ -83,6 +89,7 @@ export function buildOpenCodeModelProfiles(
   env: NodeJS.ProcessEnv = typeof process === "undefined" ? {} : process.env,
 ): AdapterModelProfileDefinition[] {
   const override = (env.PAPERCLIP_OPENCODE_CHEAP_MODEL ?? env.PAPERCLIP_OPENCODE_SMALL_MODEL)?.trim();
+  const strong = env.PAPERCLIP_OPENCODE_STRONG_MODEL?.trim();
   return [
     {
       key: "cheap",
@@ -91,6 +98,15 @@ export function buildOpenCodeModelProfiles(
       adapterConfig: override
         ? { model: override }
         : { model: DEFAULT_OPENCODE_CHEAP_MODEL, variant: "low" },
+      source: "adapter_default",
+    },
+    // Mirrors "cheap" (always present; env overrides the model), so buildOpenCodeModelProfiles({})
+    // still returns "cheap" as element 0. Auto-requested on repeated-failure re-attempts.
+    {
+      key: "escalate",
+      label: "Escalate",
+      description: "Stronger model for genuinely hard tasks / repeated-failure re-attempts.",
+      adapterConfig: { model: strong || DEFAULT_OPENCODE_STRONG_MODEL },
       source: "adapter_default",
     },
   ];

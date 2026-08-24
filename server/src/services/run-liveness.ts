@@ -65,7 +65,7 @@ const BLOCKER_RE =
   /\b(?:blocked|can't proceed|cannot proceed|unable to proceed|waiting on|need(?:s|ed)? .{0,80}\b(?:approval|access|credential|credentials|secret|api key|token|input|clarification)|requires? .{0,80}\b(?:approval|access|credential|credentials|secret|api key|token|input|clarification))\b/i;
 const NEGATED_BLOCKER_RE = /\b(?:not blocked|no blocker|no blockers|unblocked)\b/i;
 const APPROVAL_REQUIRED_RE =
-  /\b(?:approval required|requires? .{0,80}\bapproval|need(?:s|ed)? .{0,80}\bapproval|waiting on .{0,80}\bapproval|pending approval|board approval|human approval|user approval|operator approval)\b/i;
+  /\b(?:approval required|requires? .{0,80}\bapproval|need(?:s|ed)? .{0,80}\bapproval|waiting on .{0,80}\bapproval|pending .{0,80}\bapproval|is .{0,80}\bapproval|board approval|human approval|user approval|operator approval)\b/i;
 const EXTERNAL_BLOCKER_RE =
   /\b(?:can't proceed|cannot proceed|unable to proceed|waiting on|blocked by|blocked on|need(?:s|ed)?|requires?) .{0,120}\b(?:access|credential|credentials|secret|secrets|api key|token|password|login|account|permission|permissions|input|clarification)\b/i;
 const MANAGER_REVIEW_RE =
@@ -164,10 +164,32 @@ export function hasUsefulOutput(input: RunLivenessClassificationInput) {
   return combinedOutput(input).length > 0;
 }
 
+// A chunk of 12–200 chars immediately repeated ≥5 times total (1 + ≥4 more). `[\s\S]` so the chunk may
+// span newlines; the scan is length-capped so the backreference can't pathologically backtrack on huge
+// output. Language-neutral by construction (no dictionary) — catches CJK/token loops with no whitespace.
+function hasConsecutiveChunkRepetition(text: string) {
+  const scan = text.length > 20_000 ? text.slice(0, 20_000) : text;
+  return /([\s\S]{12,200}?)\1{4,}/.test(scan);
+}
+
+// Structural degeneracy screen (Round-2 B2): output that is a repetition loop or near-zero line
+// diversity, with no dictionary/language assumption (the CJK-token + unbroken-repetition failure that
+// corrupted Maven's first deliverable was graded `advanced`). Two language-neutral signals; short output
+// is skipped (a bounded continuation handles that case) so this only fires on substantive garbage.
+export function isDegenerateOutput(text: string | null | undefined) {
+  const trimmed = (text ?? "").trim();
+  if (trimmed.length < 500) return false;
+  // Signal 1: many lines, few distinct — a line-level repetition loop.
+  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length >= 12 && new Set(lines).size / lines.length < 0.25) return true;
+  // Signal 2: a short chunk repeated consecutively (a token/phrase loop, incl. newline-free CJK).
+  return hasConsecutiveChunkRepetition(trimmed);
+}
+
 export function declaredBlocker(input: RunLivenessClassificationInput) {
   if (input.issue?.status === "blocked") return true;
   const actionability = classifyRunActionability(input);
-  return actionability === "blocked_external" || actionability === "approval_required";
+  return actionability === "blocked_external" || actionability === "approval_required" || actionability === "manager_review";
 }
 
 export function looksLikePlanningOnly(input: RunLivenessClassificationInput) {
@@ -290,14 +312,15 @@ function extractNextAction(input: RunLivenessClassificationInput) {
 export function classifyRunActionability(input: RunLivenessClassificationInput): RunLivenessActionability {
   const text = actionabilityText(input);
   if (!text) return "unknown";
-  if (NEGATED_BLOCKER_RE.test(text)) {
-    return RUNNABLE_RE.test(text) ? "runnable" : "unknown";
-  }
+  // Approval and manager/escalation gates are safety-critical, so detect them
+  // before a stray negation ("not blocked") can downgrade the run to runnable.
+  // A negation may only relax a plain external blocker, never an approval or
+  // manager-review signal.
   if (APPROVAL_REQUIRED_RE.test(text)) return "approval_required";
-  if (EXTERNAL_BLOCKER_RE.test(text) || BLOCKER_RE.test(text) && /\b(?:credential|secret|api key|token|access|input|clarification)\b/i.test(text)) {
+  if (MANAGER_REVIEW_RE.test(text)) return "manager_review";
+  if (EXTERNAL_BLOCKER_RE.test(text) || (BLOCKER_RE.test(text) && /\b(?:credential|secret|api key|token|access|input|clarification)\b/i.test(text))) {
     return "blocked_external";
   }
-  if (MANAGER_REVIEW_RE.test(text)) return "manager_review";
   if (RUNNABLE_RE.test(text)) return "runnable";
   return "unknown";
 }
@@ -338,7 +361,21 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   }
 
   if (declaredBlocker(input)) {
+    if (actionability === "manager_review") {
+      return output("needs_followup", "Run flagged a change that needs manager or human review before it is safe to continue", nextAction);
+    }
+    if (actionability === "approval_required") {
+      return output("blocked", "Board approval is required before continuing review", nextAction);
+    }
     return output("blocked", issueStatus === "blocked" ? "Issue status is blocked" : "Run output declared a concrete blocker", nextAction);
+  }
+
+  // A manager/escalation signal must route to human review even when the run
+  // also produced concrete evidence — otherwise a productive run that flags a
+  // production deploy or secret rotation would fall through to "advanced" and
+  // be treated as safe to auto-continue.
+  if (actionability === "manager_review") {
+    return output("needs_followup", "Run flagged a change that needs manager or human review before it is safe to continue", nextAction);
   }
 
   if (!usefulOutput && !concreteEvidence) {
@@ -347,6 +384,14 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 
   if (concreteEvidence) {
     return output("advanced", `Run produced concrete action evidence: ${evidenceReason(evidence)}`);
+  }
+
+  // Degeneracy screen (Round-2 B2): a run with NO concrete DB evidence whose only output is a repetition
+  // loop / near-zero line diversity must not launder to `advanced` via the plan-exempt bypass below.
+  // Real evidence already won above (`concreteEvidence`), so this only screens evidence-free garbage;
+  // `empty_response` routes it into the existing bounded continuation.
+  if (!concreteEvidence && isDegenerateOutput(combinedOutput(input))) {
+    return output("empty_response", "Run output failed the degeneracy screen (repetition loop or near-zero line diversity)");
   }
 
   if (planExempt && usefulOutput) {

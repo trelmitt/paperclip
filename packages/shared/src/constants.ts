@@ -92,7 +92,7 @@ export const ADAPTER_AGNOSTIC_KEYS = [
 ] as const;
 export type AdapterAgnosticKey = (typeof ADAPTER_AGNOSTIC_KEYS)[number];
 
-export const MODEL_PROFILE_KEYS = ["cheap"] as const;
+export const MODEL_PROFILE_KEYS = ["cheap", "escalate"] as const;
 export type ModelProfileKey = (typeof MODEL_PROFILE_KEYS)[number];
 
 export const AGENT_ICON_NAMES = [
@@ -808,7 +808,10 @@ export type FinanceUnit = (typeof FINANCE_UNITS)[number];
 export const BUDGET_SCOPE_TYPES = ["company", "agent", "project"] as const;
 export type BudgetScopeType = (typeof BUDGET_SCOPE_TYPES)[number];
 
-export const BUDGET_METRICS = ["billed_cents"] as const;
+// billed_cents = real invoiced cost only (0 for subscription runs).
+// effective_cents = billed cost, or imputed token cost when nothing was billed,
+// so subscription (e.g. Claude Max) usage is governed instead of reading zero.
+export const BUDGET_METRICS = ["billed_cents", "effective_cents", "tokens"] as const;
 export type BudgetMetric = (typeof BUDGET_METRICS)[number];
 
 export const BUDGET_WINDOW_KINDS = ["calendar_month_utc", "lifetime"] as const;
@@ -1343,6 +1346,7 @@ export const PLUGIN_CAPABILITIES = [
   "ui.dashboardWidget.register",
   "ui.commentAnnotation.register",
   "ui.action.register",
+  "workspace.safety",
 ] as const;
 export type PluginCapability = (typeof PLUGIN_CAPABILITIES)[number];
 
