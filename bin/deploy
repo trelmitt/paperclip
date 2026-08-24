@@ -51,7 +51,26 @@ check_staleness() {
   return 0
 }
 
+# Untracked WIP under a typechecked src/ breaks `pnpm -r typecheck` and blocks EVERY deploy
+# (the shared-tree collision: any agent's in-flight scratch in a real package's src fails the
+# whole-monorepo gate). Fail fast with the exact files + a one-command reversible quarantine,
+# instead of a cryptic tsc error ~3 minutes into the build. `git ls-files --others
+# --exclude-standard` already respects .gitignore, so dist/, .rhen/, .paperclip/ are excluded.
+SCRATCH_RE='^(server/src/|packages/[^/]+/src/|ui/src/).*\.(ts|tsx)$'
+check_untracked_scratch() {
+  local scratch; scratch="$(git ls-files --others --exclude-standard | grep -E "$SCRATCH_RE" || true)"
+  [ -z "$scratch" ] && return 0
+  echo "UNTRACKED SCRATCH will break the typecheck gate (shared-tree collision):" >&2
+  echo "$scratch" | sed 's/^/  /' >&2
+  local q="$HOME/paperclip-scratch-quarantine-$(date +%Y%m%d-%H%M%S)"
+  echo >&2
+  echo "Quarantine them (reversible), then re-run bin/deploy:" >&2
+  echo "  q='$q'; git -C '$ROOT' ls-files --others --exclude-standard | grep -E '$SCRATCH_RE' | while IFS= read -r f; do mkdir -p \"\$q/\$(dirname \"\$f\")\"; mv \"$ROOT/\$f\" \"\$q/\$f\"; done" >&2
+  return 1
+}
+
 build_green() {
+  check_untracked_scratch
   echo "[typecheck] pnpm -r typecheck"; pnpm -r typecheck
   echo "[build] pnpm build"; pnpm build
   local newer; newer="$(src_newer_than_dist || true)"
