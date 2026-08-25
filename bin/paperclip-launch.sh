@@ -22,6 +22,13 @@
 REPO=/Users/trev/paperclip
 export PATH="/opt/homebrew/bin:$PATH"
 
+# Network bind: tailnet-only (Tailscale IP), NOT the raw LAN and NOT loopback.
+# server.bind=tailnet => the control plane listens on `tailscale ip -4` (e.g. 100.95.8.81) only;
+# 127.0.0.1:3100 stops responding, so localhost tooling must target the tailnet host
+# (bin/deploy's health check probes the tailnet IP too). Reversible: delete this line to fall
+# back to the config-file / plist bind.
+export PAPERCLIP_BIND=tailnet
+
 cd "$REPO"
 
 DIST="$REPO/server/dist/index.js"

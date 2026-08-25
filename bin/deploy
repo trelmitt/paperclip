@@ -21,7 +21,21 @@ LABEL="com.rhen.paperclip"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 DIST="$ROOT/server/dist/index.js"
-HEALTH_URL="http://127.0.0.1:3100/api/health"
+HEALTH_PORT=3100
+# The control plane binds ONE address (see server.bind): loopback->127.0.0.1, lan->0.0.0.0
+# (loopback still works), tailnet->the Tailscale IP (loopback does NOT respond). Probe loopback
+# first (fast connection-refused if bound elsewhere), then any tailnet IP, so this works under
+# every bind mode without hardcoding one. Refused != timeout, so the fallthrough is quick.
+health_hosts() { printf '127.0.0.1\n'; tailscale ip -4 2>/dev/null || true; }
+probe_health() {  # prints the first host that returns 200, else non-zero
+  local h code
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "http://${h}:${HEALTH_PORT}/api/health" 2>/dev/null || echo 000)"
+    [ "$code" = "200" ] && { printf '%s' "$h"; return 0; }
+  done < <(health_hosts)
+  return 1
+}
 
 running_pid() { launchctl list "$LABEL" 2>/dev/null | awk -F'= ' '/"PID"/{gsub(/[^0-9]/,"",$2);print $2}'; }
 
@@ -88,18 +102,17 @@ deploy() {
   echo "[restart] launchctl kickstart -k gui/$(id -u)/$LABEL"; launchctl kickstart -k "gui/$(id -u)/$LABEL"
   # Embedded Postgres cold-starts slowly here (~45-60s); a single short check false-trips a rollback
   # (the "5s verify sees false 000" trap). Poll up to 90s for a real 200 before deciding.
-  local code=000 waited=0
+  local ok_host="" waited=0
   while [ "$waited" -lt 90 ]; do
     sleep 3; waited=$((waited+3))
-    code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)"
-    [ "$code" = "200" ] && break
-    echo "  [health] waiting for control plane... ${waited}s (last=$code)"
+    if ok_host="$(probe_health)"; then break; fi
+    echo "  [health] waiting for control plane... ${waited}s"
   done
-  if [ "$code" = "200" ]; then
-    echo "[health] OK (200). Deploy complete."; rm -rf server/dist.bak
+  if [ -n "$ok_host" ]; then
+    echo "[health] OK (200 on ${ok_host}). Deploy complete."; rm -rf server/dist.bak
     check_staleness || true
   else
-    echo "[health] FAIL ($code) -> ROLLING BACK to server/dist.bak"
+    echo "[health] FAIL (no 200 on loopback or tailnet) -> ROLLING BACK to server/dist.bak"
     rm -rf server/dist && mv server/dist.bak server/dist
     launchctl kickstart -k "gui/$(id -u)/$LABEL"
     echo "[rollback] restored previous dist and restarted. Investigate before retrying."
