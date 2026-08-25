@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, findDegenerateRepetition } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -67,6 +67,32 @@ describe("parseOpenCodeJsonl", () => {
     expect(parsed.summary).toBe("Recovered and completed the task");
     expect(parsed.errorMessage).toBeNull();
     expect(parsed.toolErrors).toEqual(["File not found: e2b-adapter-result.txt"]);
+  });
+
+  it("suppresses a token-repetition collapse and marks it a run error", () => {
+    // The observed doom-loop: real text, then a runaway "!" blob until max_tokens.
+    const text = `I'll get grounded quickly, then act. Let me check the${"!".repeat(4000)}`;
+    const stdout = JSON.stringify({
+      type: "text",
+      sessionID: "session_x",
+      part: { text },
+    });
+
+    const parsed = parseOpenCodeJsonl(stdout);
+    // The blob is dropped; the useful prefix is kept with a suppression marker.
+    expect(parsed.summary).not.toContain("!!!!!!!!");
+    expect(parsed.summary).toContain("Let me check the");
+    expect(parsed.summary).toContain("[paperclip:");
+    // It becomes a run error so the run is marked failed (not a silent "succeeded").
+    expect(parsed.errorMessage).toContain("degenerate model output");
+  });
+
+  it("does not flag normal output or legit short repeated separators", () => {
+    expect(findDegenerateRepetition("A normal answer with some prose.")).toBeNull();
+    // A 100-char markdown-style rule is under the 200 threshold — must not false-trip.
+    expect(findDegenerateRepetition(`before\n${"-".repeat(100)}\nafter`)).toBeNull();
+    // A true runaway is caught.
+    expect(findDegenerateRepetition("x".repeat(250))?.index).toBe(0);
   });
 
   it("detects unknown session errors", () => {

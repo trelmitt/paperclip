@@ -1,5 +1,42 @@
 import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
 
+// A local model can fall into a token-repetition collapse: it emits the same token
+// (observed: "!") until it exhausts max_tokens and returns finish_reason=length — a *clean*
+// stop with exit 0. Without this guard the blob posts as an issue comment on a run that
+// reports "succeeded", so it is invisible to failure metrics yet visibly garbage on the board.
+// Detecting a runaway single-character run lets parse turn it into a run error (marking the run
+// failed → surfaced in metrics + routed through the normal retry/continuation path) and drop the
+// blob from the summary before it is posted.
+// ponytail: single-character runaway only — the observed collapse mode. If phrase/line loops
+// show up in the post-deploy data, extend findDegenerateRepetition to cover repeated n-grams.
+const DEGENERATE_CHAR_RUN = 200;
+
+export function findDegenerateRepetition(text: string): { message: string; index: number } | null {
+  if (text.length < DEGENERATE_CHAR_RUN) return null;
+  let runChar = "";
+  let runLen = 0;
+  let runStart = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === runChar) {
+      runLen++;
+      if (runLen >= DEGENERATE_CHAR_RUN) {
+        const label =
+          ch === "\n" ? "\\n" : ch === " " ? "space" : ch === "\t" ? "\\t" : JSON.stringify(ch);
+        return {
+          message: `degenerate model output: ${DEGENERATE_CHAR_RUN}+ consecutive ${label} characters (token-repetition loop) — output suppressed`,
+          index: runStart,
+        };
+      }
+    } else {
+      runChar = ch;
+      runLen = 1;
+      runStart = i;
+    }
+  }
+  return null;
+}
+
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
   const rec = parseObject(value);
@@ -78,9 +115,18 @@ export function parseOpenCodeJsonl(stdout: string) {
     }
   }
 
+  let summary = messages.join("\n\n").trim();
+  const degenerate = findDegenerateRepetition(summary);
+  if (degenerate) {
+    summary = `${summary.slice(0, degenerate.index).trimEnd()}\n\n[paperclip: ${degenerate.message}]`.trim();
+    // Surface as a run error so the run is marked failed (visible in metrics) and routed
+    // through the normal retry/continuation path instead of "succeeding" with a garbage comment.
+    errors.push(degenerate.message);
+  }
+
   return {
     sessionId,
-    summary: messages.join("\n\n").trim(),
+    summary,
     usage,
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
