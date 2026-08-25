@@ -129,6 +129,3 @@ export const workspaceSafety: WorkspaceSafetyService = {
     return { scanned: true, rulesApplied: LEAK_RULES.length, leakages: allLeakages, safe: allLeakages.length === 0 };
   },
 };
-
-/** Type alias re-export for callers. */
-export type { GuardCheckResult, LeakDetectionResult, WorkspaceSafetyService };
