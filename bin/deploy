@@ -35,6 +35,13 @@ restore_dist() {
   fi
 }
 
+# 0. browser-safe barrel guard — fast tripwire for Node-only code leaking into the UI bundle
+echo "[deploy] browser-safe barrel guard..."
+if ! node scripts/check-browser-safe-barrels.mjs; then
+  echo "FATAL: browser-safe barrel guard failed (Node-only value re-export in a UI-shared barrel)." >&2
+  exit 1
+fi
+
 # 1. typecheck — fail fast, writes no dist
 echo "[deploy] typecheck..."
 if ! pnpm run typecheck; then
