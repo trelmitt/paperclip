@@ -3,6 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { checkShellCommandSafety, type SafetyGuardDeclaration } from "./shell-command-safety.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
   prepareCommandManagedRuntime,
@@ -2171,35 +2172,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
 // ---------------------------------------------------------------------------
 // Safety guard enforcement
 // ---------------------------------------------------------------------------
-
-/**
- * Check if a shell command matches any blocked patterns in safety guards.
- * Returns the first matching guard key if blocked, or null if command is safe.
- */
-export function checkShellCommandSafety(
-  command: string,
-  guards: Array<{ guardKey: string; displayName: string; description: string; blockPattern: string }>,
-): string | null {
-  for (const guard of guards) {
-    try {
-      const pattern = new RegExp(guard.blockPattern);
-      if (pattern.test(command)) {
-        return guard.guardKey;
-      }
-    } catch {
-      // If the pattern is invalid, skip this guard
-      continue;
-    }
-  }
-  return null;
-}
-
-/**
- * Type alias for safety guard declaration to avoid circular dependency
- */
-export type SafetyGuardDeclaration = {
-  guardKey: string;
-  displayName: string;
-  description: string;
-  blockPattern: string;
-};
+// checkShellCommandSafety + SafetyGuardDeclaration live in the pure
+// ./shell-command-safety module (imported above for internal use) so the
+// browser-safe barrel can re-export them without pulling this node-only module.
+// Re-exported here to keep execution-target's public API unchanged.
+export { checkShellCommandSafety };
+export type { SafetyGuardDeclaration };
