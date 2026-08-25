@@ -412,11 +412,12 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     return event!;
   }
 
-  it("enforces an effective_cents budget on a $0 subscription run via imputed token cost", async () => {
+  it("keeps an effective_cents (imputed) budget visible-but-non-blocking: warns, never hard-stops a $0 subscription run", async () => {
     const { companyId, agentId } = await createBudgetFixture();
-    const service = budgetService(db);
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
 
-    // Agent hard-stop of 500 cents on the effective_cents metric.
+    // Agent hard-stop of 500 cents on the effective_cents (imputed) metric.
     await db.insert(budgetPolicies).values({
       companyId,
       scopeType: "agent",
@@ -430,7 +431,8 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       isActive: true,
     });
 
-    // Subscription run: $0 billed, but 1M output opus tokens => 7500 imputed cents.
+    // Subscription run: $0 billed, but 1M output opus tokens => 7500 imputed cents,
+    // well past both the soft threshold (400) and the hard limit (500).
     const [event] = await db
       .insert(costEvents)
       .values({
@@ -451,17 +453,28 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
 
     await service.evaluateCostEvent(event!);
 
+    // Hybrid decision: imputed economic cost stays VISIBLE (a soft warning fires,
+    // and the policy summary shows the overage) but NEVER cancels or pauses local
+    // work — only real billed dollars + token counts can hard-stop.
     const [agentAfter] = await db
       .select({ status: agents.status, pauseReason: agents.pauseReason })
       .from(agents);
-    expect(agentAfter).toEqual({ status: "paused", pauseReason: "budget" });
+    expect(agentAfter).toEqual({ status: "active", pauseReason: null });
+    expect(cancelWorkForScope).not.toHaveBeenCalled();
 
     const incidents = await db.select().from(budgetIncidents);
-    expect(incidents.some((incident) => incident.thresholdType === "hard")).toBe(true);
+    expect(incidents.some((incident) => incident.thresholdType === "hard")).toBe(false);
+    expect(incidents.some((incident) => incident.thresholdType === "soft")).toBe(true);
 
-    // New work is refused while the effective-cost hard-stop is exceeded.
+    // Visibility half: the imputed overage is reflected in the policy summary
+    // (over-limit utilization) without the scope being paused.
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((policy) => policy.metric === "effective_cents");
+    expect(summary).toMatchObject({ observedAmount: 7500, status: "hard_stop", paused: false });
+
+    // New work is NOT refused on an imputed-only overage.
     const block = await service.getInvocationBlock(companyId, agentId);
-    expect(block?.scopeType).toBe("agent");
+    expect(block).toBeNull();
   });
 
   it("raises one soft incident per window before hard-stopping and safely logging agent telemetry", async () => {

@@ -26,9 +26,17 @@ import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { effectiveCostCentsSum } from "./cost-imputation-sql.js";
 
-// Metrics whose policies are enforced. effective_cents lets subscription
-// (imputed) token usage trip the same soft/hard gates as real billed spend.
-const ENFORCED_BUDGET_METRICS = ["billed_cents", "effective_cents", "tokens"] as const;
+// Metrics whose hard-stop cancels in-flight work and blocks new invocations.
+// effective_cents (imputed subscription/local economic cost) is deliberately
+// EXCLUDED: imputed spend stays visible in finance views and can still raise
+// soft warnings, but it never cancels or blocks work. Hybrid decision — a local
+// zero-human fleet is governed on real billed dollars + token counts, never on
+// a shadow imputed cost that would wrongly cancel free local runs.
+const HARD_STOP_METRICS = ["billed_cents", "tokens"] as const;
+
+function metricCanHardStop(metric: string): boolean {
+  return (HARD_STOP_METRICS as readonly string[]).includes(metric);
+}
 
 type ScopeRecord = {
   companyId: string;
@@ -178,8 +186,8 @@ async function computeObservedAmount(
 }
 
 // The first active hard-stop policy for a scope whose observed amount has reached
-// its limit, or null. Considers every enforced metric so an effective_cents
-// policy pauses work even when billed_cents is zero.
+// its limit, or null. Considers only HARD_STOP_METRICS (billed dollars + tokens);
+// effective_cents (imputed) is excluded so imputed cost never blocks new work.
 async function firstExceededHardStopPolicy(
   db: Db,
   scope: { companyId: string; scopeType: BudgetScopeType; scopeId: string },
@@ -193,7 +201,7 @@ async function firstExceededHardStopPolicy(
         eq(budgetPolicies.scopeType, scope.scopeType),
         eq(budgetPolicies.scopeId, scope.scopeId),
         eq(budgetPolicies.isActive, true),
-        inArray(budgetPolicies.metric, [...ENFORCED_BUDGET_METRICS]),
+        inArray(budgetPolicies.metric, [...HARD_STOP_METRICS]),
       ),
     );
   for (const policy of policies) {
@@ -638,7 +646,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           if (row.notifyEnabled && observedAmount >= softThreshold) {
             await createIncidentIfNeeded(row, "soft", observedAmount);
           }
-          if (row.hardStopEnabled && observedAmount >= row.amount) {
+          if (metricCanHardStop(row.metric) && row.hardStopEnabled && observedAmount >= row.amount) {
             await resolveOpenSoftIncidents(row.id);
             await createIncidentIfNeeded(row, "hard", observedAmount);
             await pauseAndCancelScopeForBudget(row);
@@ -734,7 +742,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           }
         }
 
-        if (policy.hardStopEnabled && observedAmount >= policy.amount) {
+        if (metricCanHardStop(policy.metric) && policy.hardStopEnabled && observedAmount >= policy.amount) {
           await resolveOpenSoftIncidents(policy.id);
           const hardIncident = await createIncidentIfNeeded(policy, "hard", observedAmount);
           await pauseAndCancelScopeForBudget(policy);
