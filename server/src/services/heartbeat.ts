@@ -18570,6 +18570,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
+    const finishedAt = new Date();
+    // Claim the cancellation with a compare-and-set BEFORE terminating the child.
+    // The cancellable check above reads a stale snapshot and can race the run's
+    // own finalize path, which CAS-writes "succeeded"/"failed" from "running".
+    // Writing "cancelled" first means (a) on a lost race we keep the real outcome
+    // and skip the cancel-only teardown the finalize path already owns, and (b) on
+    // a win, the child's subsequent SIGTERM-driven in-process finalize re-reads
+    // status="cancelled" (not "running"), so its CAS-from-"running" misses and it
+    // cannot relabel a user-cancelled run as "failed". Terminating first would let
+    // that finalize win the label, because terminateHeartbeatRunProcess polls for
+    // process death and returns after the in-process finalize has already run.
+    const cancelWrite = await setRunStatusFromLive(
+      run.id,
+      "cancelled",
+      [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
+      {
+        finishedAt,
+        error: reason,
+        errorCode,
+        ...(resultJson ? { resultJson } : {}),
+      },
+    );
+    if (!cancelWrite.updated) return cancelWrite.run ?? run;
+    const cancelled = cancelWrite.run;
+
     const running = runningProcesses.get(run.id);
     try {
       if (running) {
@@ -18588,29 +18613,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
-    const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
-    });
-
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
       error: reason,
     });
 
-    if (cancelled) {
-      await appendRunEvent(cancelled, 1, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: options.eventMessage ?? "run cancelled",
-        ...(options.eventPayload ? { payload: options.eventPayload } : {}),
-      });
-      await releaseIssueExecutionAndPromote(cancelled);
-    }
+    await appendRunEvent(cancelled, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: options.eventMessage ?? "run cancelled",
+      ...(options.eventPayload ? { payload: options.eventPayload } : {}),
+    });
+    await releaseIssueExecutionAndPromote(cancelled);
 
     await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
@@ -18627,7 +18642,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      // Compare-and-set: the select above can race a run's own finalize path.
+      // An unconditional write would clobber a run that just succeeded/failed and
+      // double-release its issue. On a lost race the finalize path owns teardown.
+      const cancelWrite = await setRunStatusFromLive(run.id, "cancelled", [...CANCELLABLE_HEARTBEAT_RUN_STATUSES], {
         finishedAt: new Date(),
         error: reason,
         errorCode,
@@ -18639,6 +18657,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }),
         } : {}),
       });
+      if (!cancelWrite.updated) continue;
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: new Date(),
