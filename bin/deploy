@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# paperclip sanctioned deploy — the ONLY approved way to ship server changes.
+#
+# Do NOT `launchctl load` / `kickstart` com.rhen.paperclip by hand: an ad-hoc
+# restart can boot a RED or STALE dist, which is exactly what caused the
+# 2026-08-21 (stale dist after a branch switch) and 2026-08-22 (red build
+# crash-loop) outages. This script enforces the golden rule, in order:
+#   typecheck -> backup dist -> build -> freshness gate -> node --check
+#   -> restart -> verify pid is stable -> roll back dist.bak on crash-loop.
+#
+# Overrides (rare, deliberate):
+#   PAPERCLIP_DEPLOY_ALLOW_TYPE_ERRORS=1
+#       Deploy despite `pnpm typecheck` errors. The repo tolerates known-WIP
+#       type errors (see paperclip-launch.sh). A BUILD failure is NEVER
+#       overridable — a red build == broken dist == crash-loop.
+set -uo pipefail
+
+REPO=/Users/trev/paperclip
+LABEL=com.rhen.paperclip
+export PATH="/opt/homebrew/bin:$PATH"
+NODE=/opt/homebrew/bin/node
+DIST="$REPO/server/dist/index.js"
+BAK="$REPO/server/dist.bak"
+DOMAIN="gui/$(id -u)/$LABEL"
+
+cd "$REPO" || { echo "FATAL: cannot cd $REPO" >&2; exit 1; }
+
+echo "== paperclip deploy =="
+echo "branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null)  HEAD: $(git rev-parse --short HEAD 2>/dev/null)  dirty: $(git status --porcelain 2>/dev/null | grep -c .)"
+
+restore_dist() {
+  if [ -d "$BAK" ]; then
+    echo "[deploy] restoring previous dist from dist.bak" >&2
+    rm -rf "$REPO/server/dist" && cp -R "$BAK" "$REPO/server/dist"
+  fi
+}
+
+# 1. typecheck — fail fast, writes no dist
+echo "[deploy] typecheck..."
+if ! pnpm run typecheck; then
+  if [ "${PAPERCLIP_DEPLOY_ALLOW_TYPE_ERRORS:-0}" = "1" ]; then
+    echo "[deploy] typecheck RED but PAPERCLIP_DEPLOY_ALLOW_TYPE_ERRORS=1 -> continuing" >&2
+  else
+    echo "FATAL: typecheck failed. Fix it, or set PAPERCLIP_DEPLOY_ALLOW_TYPE_ERRORS=1 to deploy known-WIP type errors." >&2
+    exit 1
+  fi
+fi
+
+# 2. back up the current (last-known-good) dist before build overwrites it
+if [ -d "$REPO/server/dist" ]; then
+  rm -rf "$BAK" && cp -R "$REPO/server/dist" "$BAK" && echo "[deploy] backed up dist -> dist.bak"
+fi
+
+# 3. build — HARD gate, never overridable
+echo "[deploy] build..."
+if ! pnpm run build; then
+  echo "FATAL: build failed — NOT restarting (would boot a broken/stale dist)." >&2
+  restore_dist
+  exit 1
+fi
+
+# 4. freshness gate: nothing in server/src may be newer than the freshly built dist
+if [ ! -f "$DIST" ]; then
+  echo "FATAL: build produced no $DIST" >&2; restore_dist; exit 1
+fi
+if [ -n "$(find "$REPO/server/src" -type f -newer "$DIST" 2>/dev/null | head -1)" ]; then
+  echo "FATAL: server/src is newer than the built dist — build did not refresh server. Aborting." >&2
+  restore_dist; exit 1
+fi
+
+# 5. syntax-check the artifact (the same signal the launch wrapper trusts)
+if ! "$NODE" --check "$DIST"; then
+  echo "FATAL: $DIST fails node --check" >&2; restore_dist; exit 1
+fi
+
+# 6. restart via launchd (KeepAlive relaunches it if it dies)
+echo "[deploy] kickstart $DOMAIN ..."
+launchctl kickstart -k "$DOMAIN" || { echo "FATAL: kickstart failed" >&2; exit 1; }
+
+# 7. verify: pid must be present AND stable across a settle window (not crash-looping)
+pid_of()   { launchctl print "$DOMAIN" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{print $2; exit}'; }
+state_of() { launchctl print "$DOMAIN" 2>/dev/null | awk -F'= ' '/^[[:space:]]*state = /{print $2; exit}'; }
+
+sleep 5; PID1="$(pid_of)"; ST="$(state_of)"
+sleep 4; PID2="$(pid_of)"
+echo "[deploy] state=$ST pid1=$PID1 pid2=$PID2"
+if [ -z "$PID2" ] || [ "$PID1" != "$PID2" ] || [ "$ST" != "running" ]; then
+  echo "FATAL: server not stable after restart (crash-loop?). Rolling back to dist.bak." >&2
+  restore_dist
+  launchctl kickstart -k "$DOMAIN" || true
+  exit 1
+fi
+
+# 8. best-effort HTTP probe on the tailnet bind (any HTTP code = alive; 000 = no answer)
+TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
+if [ -n "$TS_IP" ]; then
+  CODE="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$TS_IP:3100/api/status" 2>/dev/null || echo 000)"
+  echo "[deploy] http://$TS_IP:3100/api/status -> $CODE"
+fi
+
+echo "✓ deploy OK — $LABEL pid $PID2 (branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null), $(git rev-parse --short HEAD 2>/dev/null)). dist.bak kept for rollback."

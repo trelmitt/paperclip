@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# paperclip pre-push ratchet (installed 2026-08-25)
+#
+# Blocks pushing a RED tree: gates on BOTH `pnpm typecheck` AND a full `pnpm build`.
+#
+# Why build, not just typecheck: on 2026-08-25 a node-only module leaked into the
+# browser bundle via a barrel value re-export. It PASSED `pnpm -r typecheck` and only
+# failed `vite build`. Typecheck alone would not have caught it. (See vault finding:
+# "node code into the browser bundle via a barrel value re-export".)
+#
+# Enable (once per clone):  git config core.hooksPath .githooks
+# Escape hatch:             git push --no-verify   (deliberate WIP-branch push only)
+set -uo pipefail
+export PATH="/opt/homebrew/bin:$PATH"
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+echo "[pre-push] typecheck + build gate (skip with --no-verify)..."
+if ! pnpm run typecheck; then
+  echo "✗ pre-push blocked: typecheck failed." >&2
+  exit 1
+fi
+if ! pnpm run build; then
+  echo "✗ pre-push blocked: build failed." >&2
+  exit 1
+fi
+echo "✓ pre-push gate green."
